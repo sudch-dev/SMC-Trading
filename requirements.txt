@@ -1,3 +1,4 @@
 flask
 kiteconnect
 python-dotenv
+gunicorn
