@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 import statistics
 
+
 def detect_order_blocks(data):
     bullish_ob = []
     bearish_ob = []
@@ -9,10 +10,31 @@ def detect_order_blocks(data):
         curr = data[i]
         next1 = data[i + 1]
         next2 = data[i + 2]
+
+        # Bearish OB: strong bullish candle followed by two closes below its low
         if curr['open'] < curr['close'] and next1['close'] < curr['low'] and next2['close'] < curr['low']:
-            bearish_ob.append(curr)
+            zone_high = max(curr['open'], curr['close'])
+            zone_low = min(curr['open'], curr['close'])
+            mitigated = False
+            for j in range(i + 3, len(data)):
+                if data[j]['high'] >= zone_low:
+                    mitigated = True
+                    break
+            if not mitigated:
+                bearish_ob.append(curr)
+
+        # Bullish OB: strong bearish candle followed by two closes above its high
         if curr['open'] > curr['close'] and next1['close'] > curr['high'] and next2['close'] > curr['high']:
-            bullish_ob.append(curr)
+            zone_high = max(curr['open'], curr['close'])
+            zone_low = min(curr['open'], curr['close'])
+            mitigated = False
+            for j in range(i + 3, len(data)):
+                if data[j]['low'] <= zone_high:
+                    mitigated = True
+                    break
+            if not mitigated:
+                bullish_ob.append(curr)
+
     return bullish_ob, bearish_ob
 
 def calculate_ema(data, period):
