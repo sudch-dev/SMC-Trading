@@ -1,186 +1,182 @@
 from datetime import datetime, timedelta
-import statistics
 import json
 
-def detect_order_blocks(data):
+# --------- Loose OB detection (daily) ---------
+def detect_order_blocks_loose(data, body_only=False, min_body_ratio=0.0):
     """
-    Expects list of candles: {'date','open','high','low','close','volume'}
-    Returns lists of OB dicts with zone_low/zone_high included.
+    data: list of candles: {'date','open','high','low','close','volume'}
+    body_only=False -> zone uses wicks (looser, wider). True -> body-only (tighter).
+    min_body_ratio: 0..1, require |close-open| >= ratio * (high-low). Use 0 for loosest.
+    Rule: OB = last opposite candle where the NEXT candle's close displaces beyond that candle's extreme.
+      - Bullish OB: down candle s.t. next close > that candle's high
+      - Bearish OB: up candle s.t. next close < that candle's low
+    No mitigation filter (looser).
     """
-    bullish_ob = []
-    bearish_ob = []
+    bulls, bears = []
     n = len(data)
-    for i in range(2, n - 2):
-        curr = data[i]
-        n1 = data[i + 1]
-        n2 = data[i + 2]
+    for i in range(1, n - 1):
+        c0 = data[i]       # candidate OB candle
+        c1 = data[i + 1]   # confirmation candle
 
-        # ----- Bearish OB: strong up candle then two closes below its low -----
-        if curr['close'] > curr['open'] and n1['close'] < curr['low'] and n2['close'] < curr['low']:
-            # OB zone (wick-inclusive convention): [open, high]
-            zone_low = curr['open']
-            zone_high = curr['high']
+        rng = max(c0['high'] - c0['low'], 1e-12)
+        body = abs(c0['close'] - c0['open'])
+        if body < min_body_ratio * rng:
+            continue  # skip tiny bodies if requested
 
-            # Mitigation: any future candle overlapping the zone
-            mitigated = False
-            for j in range(i + 3, n):
-                if (data[j]['high'] >= zone_low) and (data[j]['low'] <= zone_high):
-                    mitigated = True
-                    break
-            if not mitigated:
-                bearish_ob.append({
-                    "index": i,
-                    "timestamp": curr.get('date'),
-                    "type": "bearish",
-                    "zone_low": float(zone_low),
-                    "zone_high": float(zone_high),
-                    "candle": curr
-                })
+        if body_only:
+            # body-only zones
+            z_low = min(c0['open'], c0['close'])
+            z_high = max(c0['open'], c0['close'])
+            bull_zone_low, bull_zone_high = z_low, z_high
+            bear_zone_low, bear_zone_high = z_low, z_high
+        else:
+            # wick-inclusive (looser)
+            bull_zone_low, bull_zone_high = c0['low'], c0['open']  # bullish OB = last down candle
+            bear_zone_low, bear_zone_high = c0['open'], c0['high'] # bearish OB = last up candle
 
-        # ----- Bullish OB: strong down candle then two closes above its high -----
-        if curr['open'] > curr['close'] and n1['close'] > curr['high'] and n2['close'] > curr['high']:
-            # OB zone (wick-inclusive convention): [low, open]
-            zone_low = curr['low']
-            zone_high = curr['open']
+        # Bearish OB: up candle then next close < its low
+        if c0['close'] > c0['open'] and c1['close'] < c0['low']:
+            bears.append({
+                "index": i,
+                "timestamp": c0.get('date'),
+                "zone_low": float(min(bear_zone_low, bear_zone_high)),
+                "zone_high": float(max(bear_zone_low, bear_zone_high)),
+                "ref": c0
+            })
 
-            mitigated = False
-            for j in range(i + 3, n):
-                if (data[j]['high'] >= zone_low) and (data[j]['low'] <= zone_high):
-                    mitigated = True
-                    break
-            if not mitigated:
-                bullish_ob.append({
-                    "index": i,
-                    "timestamp": curr.get('date'),
-                    "type": "bullish",
-                    "zone_low": float(zone_low),
-                    "zone_high": float(zone_high),
-                    "candle": curr
-                })
+        # Bullish OB: down candle then next close > its high
+        if c0['open'] > c0['close'] and c1['close'] > c0['high']:
+            bulls.append({
+                "index": i,
+                "timestamp": c0.get('date'),
+                "zone_low": float(min(bull_zone_low, bull_zone_high)),
+                "zone_high": float(max(bull_zone_low, bull_zone_high)),
+                "ref": c0
+            })
 
-    return bullish_ob, bearish_ob
+    return bulls, bears
 
 
-def calculate_ema_from_closes(closes, period):
-    """Return list of EMAs for the closes; last value is the most recent EMA."""
-    if not closes:
-        return []
-    k = 2 / (period + 1)
-    ema_values = []
-    ema = float(closes[0])
-    for c in closes:
-        ema = (float(c) * k) + (ema * (1 - k))
-        ema_values.append(ema)
-    return [round(v, 2) for v in ema_values]
+# --------- Stochastic (14,3) ---------
+def stochastic_14_3(data, k_period=14, d_period=3):
+    if len(data) < k_period:
+        return None, None
+    highs = [c['high'] for c in data]
+    lows = [c['low'] for c in data]
+    closes = [c['close'] for c in data]
+
+    k_values = []
+    for i in range(k_period - 1, len(data)):
+        hi = max(highs[i - k_period + 1:i + 1])
+        lo = min(lows[i - k_period + 1:i + 1])
+        denom = (hi - lo) or 1e-12
+        k = 100.0 * (closes[i] - lo) / denom
+        k_values.append(k)
+
+    if not k_values:
+        return None, None
+    if len(k_values) < d_period:
+        return round(k_values[-1], 2), None
+
+    d_values = []
+    for j in range(d_period - 1, len(k_values)):
+        d_values.append(sum(k_values[j - d_period + 1:j + 1]) / d_period)
+
+    k_latest = round(k_values[-1], 2)
+    d_latest = round(d_values[-1], 2) if d_values else None
+    return k_latest, d_latest
 
 
-def rsi_wilder_from_closes(closes, period=14):
-    """
-    Wilder's RSI; returns the latest RSI value.
-    Requires at least period+1 closes.
-    """
-    if len(closes) < period + 1:
+# --------- Helper: newest zone & in-zone flag ---------
+def _format_zone(ob):
+    if not ob:
         return None
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        change = closes[i] - closes[i - 1]
-        gains.append(max(0.0, change))
-        losses.append(max(0.0, -change))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    ts = ob["timestamp"].strftime("%Y-%m-%d") if ob["timestamp"] else None
+    return [round(ob["zone_low"], 2), round(ob["zone_high"], 2), ts]
 
-    for i in range(period + 1, len(closes)):
-        change = closes[i] - closes[i - 1]
-        gain = max(0.0, change)
-        loss = max(0.0, -change)
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
+def _in_zone(price, zone):
+    if not zone:
+        return False
+    lo, hi, _ = zone
+    return lo <= price <= hi
 
 
-def run_smc_scan(kite):
-    # Use a longer lookback for daily candles to stabilize EMA50 & RSI14
-    from_date = datetime.now() - timedelta(days=270)  # ~9 months
+# --------- Daily scanner (OBs + Stochastic + in-zone flags) ---------
+def run_daily_ob_stoch_scan(kite, tokens_path="nifty500_tokens.json"):
+    """
+    Fetches ~1 year of DAILY candles, detects *loose* OBs and computes Stochastic(14,3).
+    Adds 'in_bullish_zone' and 'in_bearish_zone' for the most recent zones.
+    returns:
+      results[symbol] = {
+        "active_bullish_zone": [low, high, "YYYY-MM-DD"] or None,
+        "active_bearish_zone": [low, high, "YYYY-MM-DD"] or None,
+        "in_bullish_zone": bool,
+        "in_bearish_zone": bool,
+        "recent_bullish_obs": [[low, high, "YYYY-MM-DD"], ... up to 3],
+        "recent_bearish_obs": [[low, high, "YYYY-MM-DD"], ... up to 3],
+        "stoch_k": float,
+        "stoch_d": float or None,
+        "stoch_state": "Overbought/Oversold/Neutral",
+        "last_close": float
+      }
+    """
+    from_date = datetime.now() - timedelta(days=370)  # ~1 year
     to_date = datetime.now()
-    results = {}
 
-    with open("nifty500_tokens.json", "r") as f:
+    with open(tokens_path, "r") as f:
         tokens = json.load(f)
-
-    # Ensure dict[str,int] format if file is a list of dicts
     if isinstance(tokens, list):
         tokens = {item['symbol']: item['token'] for item in tokens}
 
-    # Optionally add index
-    tokens["NIFTY"] = 256265
+    tokens.setdefault("NIFTY", 256265)
 
+    results = {}
     for symbol, token in tokens.items():
         try:
-            # ---------- DAILY candles ----------
             ohlc = kite.historical_data(token, from_date, to_date, "day")
-            if not ohlc or len(ohlc) < 60:  # need history for EMA50/RSI14
+            if not ohlc or len(ohlc) < 20:
                 continue
 
-            bullish_obs, bearish_obs = detect_order_blocks(ohlc)
+            bulls, bears = detect_order_blocks_loose(
+                ohlc,
+                body_only=False,     # wick-inclusive zones (looser)
+                min_body_ratio=0.0   # accept tiny bodies (loosest)
+            )
 
-            closes = [c['close'] for c in ohlc]
-            last_close = closes[-1]
+            # newest (most recent) zones
+            active_bullish_zone = _format_zone(bulls[-1]) if bulls else None
+            active_bearish_zone = _format_zone(bears[-1]) if bears else None
 
-            ema20 = calculate_ema_from_closes(closes, 20)[-1]
-            ema50 = calculate_ema_from_closes(closes, 50)[-1]
-            rsi = rsi_wilder_from_closes(closes[-(50 + 1):], period=14)
+            # latest few for display
+            recent_bulls = [_format_zone(ob) for ob in bulls[-3:]] if bulls else []
+            recent_bears = [_format_zone(ob) for ob in bears[-3:]] if bears else []
 
-            # Volume spike vs last 10 completed daily bars
-            if len(ohlc) >= 12:
-                avg_vol = statistics.mean([c['volume'] for c in ohlc[-11:-1]])
-            else:
-                avg_vol = statistics.mean([c['volume'] for c in ohlc[:-1]]) if len(ohlc) > 1 else 0
-            volume_spike = ohlc[-1]['volume'] > 1.5 * avg_vol if avg_vol else False
+            last_close = float(ohlc[-1]['close'])
 
-            trend_tag = "Bullish" if ema20 > ema50 else ("Bearish" if ema20 < ema50 else "Neutral")
+            # in-zone flags vs newest zones
+            in_bullish = _in_zone(last_close, active_bullish_zone)
+            in_bearish = _in_zone(last_close, active_bearish_zone)
 
-            flagged = False
-            for ob in reversed(bullish_obs):
-                if ob['zone_low'] <= last_close <= ob['zone_high']:
-                    results[symbol] = {
-                        "status": "In Buy Block",
-                        "zone": [round(ob['zone_low'], 2), round(ob['zone_high'], 2)],
-                        "price": last_close,
-                        "ema20": ema20,
-                        "ema50": ema50,
-                        "rsi14": rsi,
-                        "volume_spike": volume_spike,
-                        "trend": trend_tag,
-                        "ob_time": ob["timestamp"]
-                    }
-                    flagged = True
-                    break
-
-            if flagged:
+            # stochastic(14,3)
+            k, d = stochastic_14_3(ohlc, 14, 3)
+            if k is None:
                 continue
+            state = "Overbought" if k >= 80 else ("Oversold" if k <= 20 else "Neutral")
 
-            for ob in reversed(bearish_obs):
-                if ob['zone_low'] <= last_close <= ob['zone_high']:
-                    results[symbol] = {
-                        "status": "In Sell Block",
-                        "zone": [round(ob['zone_low'], 2), round(ob['zone_high'], 2)],
-                        "price": last_close,
-                        "ema20": ema20,
-                        "ema50": ema50,
-                        "rsi14": rsi,
-                        "volume_spike": volume_spike,
-                        "trend": trend_tag,
-                        "ob_time": ob["timestamp"]
-                    }
-                    break
+            results[symbol] = {
+                "active_bullish_zone": active_bullish_zone,
+                "active_bearish_zone": active_bearish_zone,
+                "in_bullish_zone": in_bullish,
+                "in_bearish_zone": in_bearish,
+                "recent_bullish_obs": [z for z in recent_bulls if z],
+                "recent_bearish_obs": [z for z in recent_bears if z],
+                "stoch_k": k,
+                "stoch_d": d,
+                "stoch_state": state,
+                "last_close": round(last_close, 2),
+            }
 
         except Exception:
-            # Skip token-specific issues (rate limits/invalid tokens)
             continue
 
     return results
