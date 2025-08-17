@@ -2,22 +2,16 @@ from datetime import datetime, timedelta
 import statistics
 import json
 
-# ---- Loose OB detection on daily candles ----
 def detect_order_blocks(data):
-    """
-    Kept the same function name for compatibility.
-    Now uses a looser rule with ONE confirming close.
-    Returns lists of dicts with 'zone_low'/'zone_high' stored.
-    """
     bullish_ob = []
     bearish_ob = []
     n = len(data)
 
     for i in range(1, n - 1):
-        c0 = data[i]       # candidate OB candle
-        c1 = data[i + 1]   # confirmation candle (displacement)
+        c0 = data[i]
+        c1 = data[i + 1]
 
-        # Define zones (wick-inclusive, looser)
+        # Wick-inclusive zones (looser)
         bull_zone_low, bull_zone_high = c0['low'], c0['open']   # last down candle
         bear_zone_low, bear_zone_high = c0['open'], c0['high']  # last up candle
 
@@ -44,7 +38,6 @@ def detect_order_blocks(data):
     return bullish_ob, bearish_ob
 
 
-# ---- Simple EMA helper (kept because callers expect ema20/ema50 keys) ----
 def calculate_ema(data, period):
     closes = [c['close'] for c in data]
     if not closes:
@@ -57,7 +50,7 @@ def calculate_ema(data, period):
         ema_values.append(round(ema, 2))
     return ema_values
 
-# ---- Stochastic (14,3) %K/%D; we will return %K via the existing 'rsi' key ----
+
 def _stochastic_kd(data, k_period=14, d_period=3):
     if len(data) < k_period:
         return None, None
@@ -87,13 +80,10 @@ def _stochastic_kd(data, k_period=14, d_period=3):
 
 def run_smc_scan(kite):
     """
-    SAME SIGNATURE & SAME RETURN STRUCTURE as your original.
-
-    - timeframe: DAILY ("day")
-    - logic: OB detection (loose) + Stochastic(14,3)
-    - compatibility: 'rsi' field now carries Stochastic %K (float)
+    SAME signature and return structure.
+    Timeframe switched to 4-hour candles.
     """
-    from_date = datetime.now() - timedelta(days=370)  # ~1 year
+    from_date = datetime.now() - timedelta(days=60)   # ~2 months of 4h data
     to_date = datetime.now()
     results = {}
 
@@ -105,35 +95,29 @@ def run_smc_scan(kite):
 
     for symbol, token in tokens.items():
         try:
-            # ---- DAILY candles ----
-            ohlc = kite.historical_data(token, from_date, to_date, "day")
+            # -------- 4 HOUR candles --------
+            ohlc = kite.historical_data(token, from_date, to_date, "4hour")
             if not ohlc or len(ohlc) < 20:
                 continue
 
             bullish, bearish = detect_order_blocks(ohlc)
             current_price = float(ohlc[-1]['close'])
 
-            # Keep ema20/ema50 fields for backward compatibility (daily EMAs)
             ema20 = calculate_ema(ohlc, 20)[-1] if len(ohlc) >= 20 else None
             ema50 = calculate_ema(ohlc, 50)[-1] if len(ohlc) >= 50 else ema20
 
-            # Stochastic(14,3): store %K in 'rsi' field to preserve structure
             stoch_k, stoch_d = _stochastic_kd(ohlc, 14, 3)
-            rsi_value = stoch_k  # <- IMPORTANT: keeping key name 'rsi' as requested
+            rsi_value = stoch_k   # keep structure: put Stochastic %K in 'rsi' key
 
-            # Volume spike vs last 10 completed daily bars (unchanged key)
             if len(ohlc) >= 12:
                 avg_volume = statistics.mean([c['volume'] for c in ohlc[-11:-1]])
             else:
                 avg_volume = statistics.mean([c['volume'] for c in ohlc[:-1]]) if len(ohlc) > 1 else 0
             volume_spike = ohlc[-1]['volume'] > 1.5 * avg_volume if avg_volume else False
 
-            # Trend label using price vs ema20 to preserve 'trend' key semantics
             trend = "Bullish" if (ema20 is not None and current_price > ema20) else \
                     ("Bearish" if (ema20 is not None and current_price < ema20) else "Neutral")
 
-            # Fill results exactly like before
-            # Use newest OB from each side and check if price is inside
             filled = False
             for ob in reversed(bullish):
                 if ob['zone_low'] <= current_price <= ob['zone_high']:
@@ -143,7 +127,7 @@ def run_smc_scan(kite):
                         "price": current_price,
                         "ema20": ema20,
                         "ema50": ema50,
-                        "rsi": rsi_value,            # %K stored here to keep structure
+                        "rsi": rsi_value,   # stochastic %K
                         "volume_spike": volume_spike,
                         "trend": trend
                     }
@@ -161,15 +145,11 @@ def run_smc_scan(kite):
                         "price": current_price,
                         "ema20": ema20,
                         "ema50": ema50,
-                        "rsi": rsi_value,            # %K stored here
+                        "rsi": rsi_value,   # stochastic %K
                         "volume_spike": volume_spike,
                         "trend": trend
                     }
-                    filled = True
                     break
-
-            # If not currently in any zone, you may skip symbol to match old behavior
-            # (i.e., only symbols inside an OB appear in results)
 
         except Exception:
             continue
