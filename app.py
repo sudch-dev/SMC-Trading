@@ -21,7 +21,7 @@ API_SECRET = os.getenv("API_SECRET", "")
 # Render keep-alive config
 # Set KEEPALIVE_URL to something like: https://your-app.onrender.com/ping
 KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
-KEEPALIVE_INTERVAL_SEC = int(os.getenv("KEEPALIVE_INTERVAL_SEC", "25"))  # 20–30s works fine
+KEEPALIVE_INTERVAL_SEC = int(os.getenv("KEEPALIVE_INTERVAL_SEC", "240"))  # 20–30s works fine
 ENABLE_KEEPALIVE = bool(KEEPALIVE_URL)
 
 IST = pytz.timezone("Asia/Kolkata")
