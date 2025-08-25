@@ -95,7 +95,7 @@ def _keepalive_loop():
     while True:
         try:
             # Use GET so Render shows it in logs; keep timeout small.
-            r = session.get(KEEPALIVE_URL, timeout=8)
+            r = session.get(KEEPALIVE_URL, timeout=60)
             # Optional: log minimal info to stdout
             print(f"[KEEPALIVE] {datetime.now(IST).strftime('%H:%M:%S')} → {r.status_code}")
         except Exception as e:
