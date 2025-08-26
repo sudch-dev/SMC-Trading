@@ -45,8 +45,8 @@ def dashboard():
 @app.route('/api/smc-status')
 def api_smc_status():
     """
-    Returns the latest SMC scan.
-    If not logged in yet, returns an error dict (frontend can show 'Login first').
+    Returns the latest scan. Frontend consumes:
+      { status, ts, budget, picks[], errors[], diag{} }
     """
     global smc_status
     if access_token:
