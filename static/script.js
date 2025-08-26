@@ -1,10 +1,9 @@
 /* ============ SMC Dashboard Frontend ============ */
-/* Renders picks, places LIMIT entries, and handles non-JSON errors gracefully. */
+/* Renders picks, places LIMIT entries, and passes LONG/SHORT intent to server. */
 
 function rowHTML(p) {
   const strike = p.strike != null ? ` ${p.strike}` : '';
   const lots = p.suggested_lots ?? 0;
-  const qty = lots * (p.lot_size || 1);
   const tp = p.tp != null ? p.tp.toFixed(2) : '—';
   const sl = p.sl != null ? p.sl.toFixed(2) : '—';
 
@@ -19,10 +18,14 @@ function rowHTML(p) {
       <div class="muted">Entry will be placed as <b>LIMIT</b> (server picks price)</div>
       <div class="row">
         <label>Lots:</label>
-        <input type="number" min="0" step="1" value="${lots}" data-sym="${p.symbol}" data-lot="${p.lot_size}"
+        <input type="number" min="0" step="1" value="${lots}"
+               data-sym="${p.symbol}"
+               data-lot="${p.lot_size}"
                data-action="${p.entry_action || (p.trade_type === 'LONG' ? 'BUY' : 'SELL')}"
+               data-type="${p.type}"                   <!-- CE / PE -->
+               data-trade_type="${p.trade_type}"       <!-- LONG / SHORT -->
                data-tp="${p.tp ?? ''}" data-sl="${p.sl ?? ''}">
-        <button class="btn" onclick="execOrder(this)">Execute (with TP/SL)</button>
+        <button class="btn" onclick="execOrder(this)">${p.trade_type === 'LONG' ? 'BUY' : 'SELL'} (with TP/SL)</button>
       </div>
     </div>
   `;
@@ -40,11 +43,17 @@ async function execOrder(btn) {
   }
 
   const symbol = input.getAttribute('data-sym');
-  const action = input.getAttribute('data-action'); // BUY/SELL
+  const actionFallback = input.getAttribute('data-action');  // legacy
+  const optType = input.getAttribute('data-type');           // CE / PE
+  const tradeType = input.getAttribute('data-trade_type');   // LONG / SHORT
   const tp = parseFloat(input.getAttribute('data-tp') || 'NaN');
   const sl = parseFloat(input.getAttribute('data-sl') || 'NaN');
 
-  if (!confirm(`Place ${action} ${qty} of ${symbol}?\nTP: ${isNaN(tp)?'—':tp}\nSL: ${isNaN(sl)?'—':sl}\n(Entry will be LIMIT; server picks price)`)) return;
+  const verb = (tradeType === 'LONG') ? 'BUY' : 'SELL';
+  if (!confirm(
+    `Place ${verb} ${qty} of ${symbol} [${tradeType} ${optType}]?\n` +
+    `TP: ${isNaN(tp)?'—':tp}\nSL: ${isNaN(sl)?'—':sl}\n(Entry LIMIT; server picks price)`
+  )) return;
 
   btn.disabled = true; const oldText = btn.textContent; btn.textContent = 'Placing…';
 
@@ -54,10 +63,11 @@ async function execOrder(btn) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         symbol,
-        action,
+        action: actionFallback,   // server will override if trade_type provided
+        type: optType,            // CE / PE
+        trade_type: tradeType,    // LONG / SHORT  <-- prevents action drift
         quantity: qty,
         order_type: 'LIMIT',      // always LIMIT now
-        // omit price so backend derives from best bid/ask
         with_tp_sl: true,
         tp: isNaN(tp) ? null : tp,
         sl: isNaN(sl) ? null : sl,
@@ -65,7 +75,6 @@ async function execOrder(btn) {
       })
     });
 
-    // Try JSON first; on failure show readable text
     let data;
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (ct.includes('application/json')) {
@@ -110,10 +119,9 @@ async function loadScan() {
   for (const k in buckets) buckets[k].innerHTML = '<li>Loading…</li>';
 
   try {
-    const res = await fetch('/api/smc-status', { cache: 'reload' }); // Safari-friendly
-
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    const res = await fetch('/api/smc-status', { cache: 'reload' });
     let data;
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (ct.includes('application/json')) {
       data = await res.json();
     } else {
