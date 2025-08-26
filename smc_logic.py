@@ -1,10 +1,10 @@
 import os
 from datetime import datetime, date, timedelta
-from math import log1p
+from math import log1p, log, sqrt, exp
 import json, gzip
 from pathlib import Path
 
-# ---------------- Config ----------------
+# ======================= CONFIG =======================
 BUDGET = float(os.getenv("BUDGET", "10000"))             # budget per pick
 RING_STRIKES = int(os.getenv("RING_STRIKES", "4"))       # strikes each side of ATM
 MAX_STOCKS = int(os.getenv("MAX_STOCKS", "50"))          # cap universe
@@ -14,6 +14,31 @@ TP_MULT_LONG   = float(os.getenv("TP_MULT_LONG", "1.50"))
 SL_MULT_LONG   = float(os.getenv("SL_MULT_LONG", "0.70"))
 TP_MULT_SHORT  = float(os.getenv("TP_MULT_SHORT", "0.60"))
 SL_MULT_SHORT  = float(os.getenv("SL_MULT_SHORT", "1.50"))
+
+# Greeks model (annualized)
+RISK_FREE = float(os.getenv("RISK_FREE", "0.07"))        # ~7% India
+DIV_YIELD = float(os.getenv("DIV_YIELD", "0.00"))        # dividend yield for stocks
+
+# --- Greeks gates (tunable) ---
+# IV ranges (annualized as decimals, e.g., 0.18 = 18%)
+IV_MIN_LONG   = float(os.getenv("IV_MIN_LONG",  "0.12"))
+IV_MAX_LONG   = float(os.getenv("IV_MAX_LONG",  "0.45"))
+IV_MIN_SHORT  = float(os.getenv("IV_MIN_SHORT", "0.28"))   # prefer short when IV is elevated
+
+# Delta bands (abs value for puts)
+DELTA_MIN_CALL = float(os.getenv("DELTA_MIN_CALL", "0.30"))
+DELTA_MAX_CALL = float(os.getenv("DELTA_MAX_CALL", "0.65"))
+DELTA_MIN_PUT  = float(os.getenv("DELTA_MIN_PUT",  "0.30"))
+DELTA_MAX_PUT  = float(os.getenv("DELTA_MAX_PUT",  "0.65"))
+
+# Gamma cap (avoid ultra-near-expiry convexity blow-ups)
+GAMMA_MAX = float(os.getenv("GAMMA_MAX", "0.02"))
+
+# Theta daily bleed cap as fraction of premium (e.g., 0.02 => ≤2% of premium/day)
+THETA_MAX_PCT = float(os.getenv("THETA_MAX_PCT", "0.02"))
+
+# If Greeks missing, should we keep the pick? (0/1)
+ALLOW_IF_NO_GREEKS = os.getenv("ALLOW_IF_NO_GREEKS", "0") in ("1", "true", "True")
 
 DEBUG_SCAN = os.getenv("DEBUG_SCAN", "0") in ("1", "true", "True")
 
@@ -34,7 +59,7 @@ NSE_PATH  = CACHE_DIR / "nse_slim.json.gz"
 _TOKEN_CACHE = {}   # symbol -> NSE instrument_token
 
 
-# --------- Utilities ---------
+# ======================= UTILITIES =======================
 def _gz_write(path, obj):
     try:
         with gzip.open(path, "wt", encoding="utf-8") as f:
@@ -47,7 +72,6 @@ def _gz_read(path):
         return json.load(f)
 
 def _slim_rows_nfo(raw, allow_names):
-    """Keep only tiny fields and only for our 50 names & CE/PE."""
     out = []
     allow = set(allow_names)
     for r in raw:
@@ -68,7 +92,6 @@ def _slim_rows_nfo(raw, allow_names):
     return out
 
 def _slim_rows_nse(raw, allow_syms):
-    """Only keep token mapping for the 50 underlyings."""
     need = set(allow_syms)
     out = []
     for r in raw:
@@ -83,31 +106,19 @@ def _slim_rows_nse(raw, allow_syms):
     return out
 
 def _load_instruments(kite):
-    """
-    Returns: (nfo_slim_rows, nse_slim_rows)
-    • First call per dyno: fetch full dumps, slim, gzip to /tmp.
-    • Subsequent calls: read small gz files (fast, low-RAM).
-    """
     if NFO_PATH.exists() and NSE_PATH.exists():
         try:
             return _gz_read(NFO_PATH), _gz_read(NSE_PATH)
         except Exception:
-            # fall back to refetch
             pass
-
     raw_nfo = kite.instruments("NFO") or []
     raw_nse = kite.instruments("NSE") or []
-
     nfo_rows = _slim_rows_nfo(raw_nfo, NIFTY50)
     nse_rows = _slim_rows_nse(raw_nse, NIFTY50)
-
-    # free heavy lists ASAP
     del raw_nfo, raw_nse
-
     _gz_write(NFO_PATH, nfo_rows)
     _gz_write(NSE_PATH, nse_rows)
     return nfo_rows, nse_rows
-
 
 def _map_tokens(nse_rows, symbols):
     global _TOKEN_CACHE
@@ -175,7 +186,9 @@ def _score(q, lot, ltp, trade_type):
     aff = 1.0 if (trade_type == "LONG" and ltp and (ltp*lot) <= BUDGET) else 0.0
     return 0.6*liq - 0.3*spr + 0.1*aff
 
-def _trade_type_for_side(side, ema5, ema10, px, r1, s1, rsi):
+
+# ======================= SMC (TA) DECISION =======================
+def _trade_bias_from_ta(side, ema5, ema10, px, r1, s1, rsi):
     overbought = (rsi is not None and rsi >= 70)
     oversold   = (rsi is not None and rsi <= 30)
     bull = (ema5 and ema10 and ema5 > ema10) and (px > r1) and (rsi is None or rsi < 70)
@@ -188,7 +201,137 @@ def _trade_type_for_side(side, ema5, ema10, px, r1, s1, rsi):
         return "SHORT", "Bearish weak/exhausted"
 
 
-# ---------------- Main Scan ----------------
+# ======================= BLACK-SCHOLES / GREEKS =======================
+try:
+    from math import erf
+except ImportError:
+    def erf(x):
+        sign = 1 if x >= 0 else -1
+        x = abs(x)
+        a1,a2,a3,a4,a5 = 0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429
+        t = 1.0/(1.0+0.3275911*x)
+        y = 1 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t*exp(-x*x)
+        return sign*y
+
+def _phi(x):  return (1.0 / (sqrt(2.0*3.141592653589793))) * exp(-0.5*x*x)
+def _Phi(x):  return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+def _yearfrac(start_dt, end_dt):
+    days = max(0.0, (end_dt.date() - start_dt.date()).days)
+    return max(1.0/365.0, days/365.0)
+
+def bs_price(side, S, K, T, r=RISK_FREE, q=DIV_YIELD, sigma=0.2):
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0: return None
+    d1 = (log(S/K) + (r - q + 0.5*sigma*sigma)*T) / (sigma*sqrt(T))
+    d2 = d1 - sigma*sqrt(T)
+    disc_r, disc_q = exp(-r*T), exp(-q*T)
+    if side == "CE": return disc_q*S*_Phi(d1) - disc_r*K*_Phi(d2)
+    else:            return disc_r*K*_Phi(-d2) - disc_q*S*_Phi(-d1)
+
+def bs_greeks(side, S, K, T, r=RISK_FREE, q=DIV_YIELD, sigma=0.2):
+    if S <= 0 or K <= 0 or T <= 0 or sigma is None or sigma <= 0:
+        return {k: None for k in ("delta","gamma","theta","vega","rho")}
+    d1 = (log(S/K) + (r - q + 0.5*sigma*sigma)*T) / (sigma*sqrt(T))
+    d2 = d1 - sigma*sqrt(T)
+    disc_r, disc_q = exp(-r*T), exp(-q*T)
+    pdf = _phi(d1)
+    if side == "CE":
+        delta = disc_q * _Phi(d1)
+        theta = ( - (disc_q*S*pdf*sigma)/(2*sqrt(T)) - r*disc_r*K*_Phi(d2) + q*disc_q*S*_Phi(d1) )
+        rho   =  K*T*disc_r*_Phi(d2)
+    else:
+        delta = -disc_q * _Phi(-d1)
+        theta = ( - (disc_q*S*pdf*sigma)/(2*sqrt(T)) + r*disc_r*K*_Phi(-d2) - q*disc_q*S*_Phi(-d1) )
+        rho   = -K*T*disc_r*_Phi(-d2)
+    gamma = disc_q * pdf / (S*sigma*sqrt(T))
+    vega  = disc_q * S * pdf * sqrt(T)
+    return {"delta": float(delta), "gamma": float(gamma),
+            "theta": float(theta/365.0),      # per day
+            "vega":  float(vega/100.0),       # per +1.00 vol
+            "rho":   float(rho/100.0)}        # per +1.00 rate
+
+def implied_vol(side, S, K, T, price, r=RISK_FREE, q=DIV_YIELD, lo=1e-4, hi=5.0, tol=1e-4, max_iter=60):
+    if price is None or price <= 0 or S <= 0 or K <= 0 or T <= 0: return None
+    # Expand bracket if needed
+    for _ in range(10):
+        plo = bs_price(side, S, K, T, r, q, lo)
+        phi = bs_price(side, S, K, T, r, q, hi)
+        if plo is None or phi is None: return None
+        if (plo - price) * (phi - price) <= 0: break
+        hi *= 1.5
+        if hi > 10: break
+    a,b = lo,hi
+    fa = bs_price(side,S,K,T,r,q,a) - price
+    fb = bs_price(side,S,K,T,r,q,b) - price
+    if fa*fb > 0: return None
+    for _ in range(max_iter):
+        m  = 0.5*(a+b)
+        fm = bs_price(side,S,K,T,r,q,m) - price
+        if abs(fm) < tol: return float(m)
+        if fa*fm <= 0: b,fb = m,fm
+        else:         a,fa = m,fm
+    return float(0.5*(a+b))
+
+
+# ======================= GREEK-AWARE SMC =======================
+def _apply_greeks_gates(side, base_trade_type, ltp, iv, greeks):
+    """
+    Enforce Greeks constraints on the base TA decision.
+    Returns (final_trade_type, reason_suffix, passed)
+    """
+    if iv is None or greeks.get("delta") is None:
+        if ALLOW_IF_NO_GREEKS:
+            return base_trade_type, "Greeks missing (allowed)", True
+        return "SHORT" if base_trade_type=="LONG" else base_trade_type, "Greeks missing (blocked long)", False
+
+    delta = greeks.get("delta") or 0.0
+    gamma = greeks.get("gamma") or 0.0
+    theta = greeks.get("theta") or 0.0  # per day; usually negative for longs
+
+    # theta bleed fraction of premium/day (positive magnitude)
+    theta_bleed_pct = abs(theta) / max(ltp, 1e-9)
+
+    ok = True
+    fails = []
+
+    if base_trade_type == "LONG":
+        # IV range
+        if not (IV_MIN_LONG <= iv <= IV_MAX_LONG):
+            ok = False; fails.append(f"IV {iv:.2f} ∉ [{IV_MIN_LONG:.2f},{IV_MAX_LONG:.2f}]")
+        # Delta band
+        if side == "CE":
+            if not (DELTA_MIN_CALL <= delta <= DELTA_MAX_CALL):
+                ok = False; fails.append(f"Δ {delta:.2f} (call band {DELTA_MIN_CALL}-{DELTA_MAX_CALL})")
+        else:
+            if not (DELTA_MIN_PUT <= abs(delta) <= DELTA_MAX_PUT):
+                ok = False; fails.append(f"|Δ| {abs(delta):.2f} (put band {DELTA_MIN_PUT}-{DELTA_MAX_PUT})")
+        # Gamma cap
+        if gamma > GAMMA_MAX:
+            ok = False; fails.append(f"Γ {gamma:.4f} > {GAMMA_MAX}")
+        # Theta bleed
+        if theta_bleed_pct > THETA_MAX_PCT:
+            ok = False; fails.append(f"θ {theta_bleed_pct:.2%} > {THETA_MAX_PCT:.2%} per day")
+
+        if ok:
+            return "LONG", "Greeks ok", True
+        else:
+            return "SHORT", "Greeks fail: " + "; ".join(fails), False
+
+    else:  # base SHORT
+        # For shorts, prefer elevated IV; delta extremes are okay but avoid ultra-gamma
+        if iv < IV_MIN_SHORT:
+            ok = False; fails.append(f"IV {iv:.2f} < {IV_MIN_SHORT:.2f}")
+        if gamma > GAMMA_MAX:
+            ok = False; fails.append(f"Γ {gamma:.4f} > {GAMMA_MAX}")
+
+        if ok:
+            return "SHORT", "Greeks favor short", True
+        else:
+            # If short gates fail, we won’t flip to long; keep SHORT but mark weak
+            return "SHORT", "Weak short (Greeks fail: " + "; ".join(fails) + ")", False
+
+
+# ======================= MAIN SCAN =======================
 def run_smc_scan(kite):
     out = {"status":"ok","ts":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
            "budget":BUDGET,"picks":[],"errors":[],"diag":{}}
@@ -209,7 +352,7 @@ def run_smc_scan(kite):
         # token map for underlying stocks (NSE)
         tokens = _map_tokens(nse, NIFTY50)
 
-        # TA per stock
+        # TA per stock (daily)
         ta = {}
         last_px = {}
         to_d = datetime.now(); fr_d = to_d - timedelta(days=40)
@@ -242,7 +385,7 @@ def run_smc_scan(kite):
                 continue
             by_name.setdefault(nm, []).append(r)
 
-        # Candidates near ATM for each name; decide LONG/SHORT per side
+        # Build candidate list near ATM
         candidates = []
         for nm, rows in by_name.items():
             strikes = sorted({r.get("strike") for r in rows if r.get("strike") is not None})
@@ -254,19 +397,18 @@ def run_smc_scan(kite):
             for r in rows:
                 if r.get("strike") not in ring: continue
                 side = r.get("instrument_type")
-                trade_type, rationale = _trade_type_for_side(
-                    side,
-                    ta[nm]["ema5"], ta[nm]["ema10"],
-                    ta[nm]["px"], ta[nm]["r1"], ta[nm]["s1"], ta[nm]["rsi"]
+                # Base TA bias
+                base_type, rationale = _trade_bias_from_ta(
+                    side, ta[nm]["ema5"], ta[nm]["ema10"], ta[nm]["px"], ta[nm]["r1"], ta[nm]["s1"], ta[nm]["rsi"]
                 )
-                candidates.append(("NFO:"+r["tradingsymbol"], r, side, trade_type, rationale, nm))
+                candidates.append(("NFO:"+r["tradingsymbol"], r, side, base_type, rationale, nm))
 
         out["diag"]["candidates"]=len(candidates)
         if not candidates:
             out["errors"].append("No option candidates after ring filter")
             return out
 
-        # Quote and score
+        # Quote in batches
         quotes = {}
         for i in range(0, len(candidates), 60):
             batch=[s for s,_,_,_,_,_ in candidates[i:i+60]]
@@ -275,45 +417,67 @@ def run_smc_scan(kite):
             except Exception as e:
                 out["errors"].append(f"quote error: {str(e)}")
 
+        # Score and compute Greeks-aware decision
         scored = []
-        for sym, meta, side, trade_type, rationale, nm in candidates:
-            q=quotes.get(sym) or {}
-            ltp=q.get("last_price") or 0.0
-            lot=meta.get("lot_size") or 1
-            sc=_score(q, lot, ltp, trade_type)
+        for sym, meta, side, base_type, rationale, nm in candidates:
+            q = quotes.get(sym) or {}
+            ltp = float(q.get("last_price") or 0.0)
+            lot = int(meta.get("lot_size") or 1)
+            sc  = _score(q, lot, ltp, base_type)
 
-            # sizing (longs only; shorts require margin)
+            # ---- IV + Greeks inputs ----
+            S   = float(last_px.get(nm) or 0.0)  # underlying spot
+            K   = float(meta.get("strike") or 0.0)
+            now  = datetime.now()
+            expd = _to_date(meta.get("expiry"))
+            exp_dt = datetime.combine(expd, datetime.min.time()) if hasattr(expd, "year") else now
+            T   = _yearfrac(now, exp_dt)
+
+            iv  = implied_vol(side, S, K, T, ltp) if (S>0 and K>0 and T>0 and ltp>0) else None
+            gks = bs_greeks(side, S, K, T, sigma=iv) if iv else {k: None for k in ("delta","gamma","theta","vega","rho")}
+
+            # ---- Apply Greeks gates on top of TA bias ----
+            final_type, greek_note, _passed = _apply_greeks_gates(side, base_type, ltp, iv, gks)
+
+            # ---- sizing (longs only) ----
             lot_cost = ltp * lot
-            lots = int(BUDGET // lot_cost) if (trade_type=="LONG" and lot_cost>0) else 0
+            lots = int(BUDGET // lot_cost) if (final_type=="LONG" and lot_cost>0) else 0
 
-            if trade_type == "LONG":
+            # ---- TP/SL & actions ----
+            if final_type == "LONG":
                 tp = _tick_round(ltp * TP_MULT_LONG)
                 sl = _tick_round(ltp * SL_MULT_LONG)
-                entry_action = "BUY"
-                exit_action = "SELL"
+                entry_action, exit_action = "BUY", "SELL"
             else:
                 tp = _tick_round(ltp * TP_MULT_SHORT)
                 sl = _tick_round(ltp * SL_MULT_SHORT)
-                entry_action = "SELL"
-                exit_action = "BUY"
+                entry_action, exit_action = "SELL", "BUY"
 
             scored.append({
                 "symbol": sym,
                 "tradingsymbol": meta.get("tradingsymbol"),
                 "name": nm,
-                "type": side,
-                "trade_type": trade_type,
+                "type": side,                          # CE/PE
+                "trade_type": final_type,              # LONG/SHORT after Greeks
                 "strike": float(meta.get("strike")) if meta.get("strike") is not None else None,
                 "expiry": str(_to_date(meta.get("expiry"))) if meta.get("expiry") else None,
                 "ltp": float(ltp),
                 "lot_size": int(lot),
                 "score": round(sc,6),
                 "suggested_lots": lots,
-                "reason": f"{nm} {side} → {trade_type} | {rationale}",
+                "reason": f"{nm} {side} → {final_type} | TA: {rationale} | Gk: {greek_note}",
                 "tp": tp,
                 "sl": sl,
                 "entry_action": entry_action,
                 "exit_action": exit_action,
+
+                # Greeks fields
+                "iv": float(iv) if iv else None,
+                "delta": gks.get("delta"),
+                "gamma": gks.get("gamma"),
+                "theta_per_day": gks.get("theta"),
+                "vega_per_volpt": gks.get("vega"),
+                "rho_per_ratept": gks.get("rho"),
             })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
