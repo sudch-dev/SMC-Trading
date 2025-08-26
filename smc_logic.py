@@ -1,4 +1,4 @@
-# smc_logic.py
+# smc_logic.py  (JSON-safe)
 import os
 from datetime import datetime, date, timedelta
 from math import log1p
@@ -32,33 +32,26 @@ NIFTY50 = [
 _INSTR_CACHE = {"loaded": False, "nfo": [], "nse": []}
 _TOKEN_CACHE = {}   # NSE underlying token map (symbol -> instrument_token)
 
-
-# ---------------- Utilities ----------------
-def _load_instruments(kite):
-    if not _INSTR_CACHE["loaded"]:
-        _INSTR_CACHE["nfo"] = kite.instruments("NFO") or []
-        _INSTR_CACHE["nse"] = kite.instruments("NSE") or []
-        _INSTR_CACHE["loaded"] = True
-    return _INSTR_CACHE["nfo"], _INSTR_CACHE["nse"]
-
-def _map_tokens(nse_rows, symbols):
-    """Build NSE underlying token map once."""
-    global _TOKEN_CACHE
-    if _TOKEN_CACHE:
-        return _TOKEN_CACHE
-    wanted = set(symbols)
-    for r in nse_rows:
-        tsym = r.get("tradingsymbol")
-        if tsym in wanted:
-            _TOKEN_CACHE[tsym] = r.get("instrument_token")
-            if len(_TOKEN_CACHE) == len(wanted):
-                break
-    return _TOKEN_CACHE
+# ---------------- Safe/utility helpers ----------------
+def _safe_date_str(obj):
+    """Return YYYY-MM-DD or None/string; ensures JSON-safe."""
+    if not obj:
+        return None
+    if isinstance(obj, (datetime, date)):
+        try:
+            return obj.strftime("%Y-%m-%d")
+        except Exception:
+            return str(obj)
+    return str(obj)
 
 def _to_date(obj):
-    if not obj: return None
-    try: return obj.date()
-    except Exception: return obj
+    """Return date object if possible (used internally only)."""
+    if not obj:
+        return None
+    try:
+        return obj.date()
+    except Exception:
+        return obj
 
 def _ema(vals, p):
     if not vals: return None
@@ -86,7 +79,8 @@ def _nearest_expiry(rows):
     today=date.today()
     exps=sorted({_to_date(r["expiry"]) for r in rows if r.get("expiry")})
     for d in exps:
-        if d>=today: return d
+        if isinstance(d, date) and d>=today:
+            return d
     return exps[-1] if exps else None
 
 def _ring(strikes, atm, steps):
@@ -96,7 +90,6 @@ def _ring(strikes, atm, steps):
     return set(strikes[lo:hi+1])
 
 def _tick_round(x, tick=TICK_SIZE):
-    """Round any price to the nearest exchange tick (₹0.05 by default)."""
     if x is None: return None
     return round(round(float(x)/tick)*tick, 2)
 
@@ -121,6 +114,26 @@ def _trade_type_for_side(side, ema5, ema10, px, r1, s1, rsi):
     else:  # PE
         return ("LONG","Bearish confirmation") if (bear and not oversold) else ("SHORT","Bearish weak/exhausted")
 
+# -------- instruments / token mapping --------
+def _load_instruments(kite):
+    if not _INSTR_CACHE["loaded"]:
+        _INSTR_CACHE["nfo"] = kite.instruments("NFO") or []
+        _INSTR_CACHE["nse"] = kite.instruments("NSE") or []
+        _INSTR_CACHE["loaded"] = True
+    return _INSTR_CACHE["nfo"], _INSTR_CACHE["nse"]
+
+def _map_tokens(nse_rows, symbols):
+    global _TOKEN_CACHE
+    if _TOKEN_CACHE:
+        return _TOKEN_CACHE
+    wanted = set(symbols)
+    for r in nse_rows:
+        tsym = r.get("tradingsymbol")
+        if tsym in wanted:
+            _TOKEN_CACHE[tsym] = r.get("instrument_token")
+            if len(_TOKEN_CACHE) == len(wanted):
+                break
+    return _TOKEN_CACHE
 
 # ---------------- Core Scan ----------------
 def run_smc_scan(kite):
@@ -129,56 +142,62 @@ def run_smc_scan(kite):
       {
         status, ts, budget, picks: [ ... ], errors: [], diag: {}
       }
-    Each pick includes:
-      symbol, tradingsymbol, name, type(CE/PE), trade_type(LONG/SHORT),
-      strike, expiry, ltp, lot_size, suggested_lots, score, reason,
-      tp, sl, entry_action(BUY/SELL), exit_action(SELL/BUY)
+    All values JSON-safe (no datetime objects).
     """
-    out = {"status":"ok","ts":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-           "budget":BUDGET,"picks":[],"errors":[],"diag":{}}
-    try:
-        # 1) Load instruments (cached)
-        nfo, nse = _load_instruments(kite)
+    out = {
+        "status": "ok",
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "budget": BUDGET,
+        "picks": [],
+        "errors": [],
+        "diag": {}
+    }
 
-        # 2) Filter to NIFTY50 stock options (CE/PE)
+    try:
+        # instruments
+        nfo, nse = _load_instruments(kite)
         base = [r for r in nfo if r.get("name") in NIFTY50 and r.get("instrument_type") in ("CE","PE")]
-        out["diag"]["nfo_total"] = len(nfo)
-        out["diag"]["nfo_filtered"] = len(base)
+        out["diag"]["nfo_total"] = int(len(nfo))
+        out["diag"]["nfo_filtered"] = int(len(base))
         if not base:
             out["status"]="error"; out["errors"].append("No NFO rows for NIFTY50"); return out
 
-        # 3) Nearest expiry
+        # nearest expiry
         exp = _nearest_expiry(base)
-        out["diag"]["expiry"] = str(exp) if exp else None
+        out["diag"]["expiry"] = _safe_date_str(exp)
         if not exp:
             out["status"]="error"; out["errors"].append("No upcoming expiry"); return out
         base = [r for r in base if r.get("expiry") and _to_date(r["expiry"])==exp]
 
-        # 4) Map NSE tokens for underlyings
+        # map underlying tokens
         tokens = _map_tokens(nse, NIFTY50)
 
-        # 5) TA per stock (daily)
+        # TA per stock (daily)
         ta = {}; last_px = {}
-        to_d=datetime.now(); fr_d=to_d - timedelta(days=40)
+        to_d = datetime.now(); fr_d = to_d - timedelta(days=40)
         for sym in NIFTY50:
             t = tokens.get(sym)
             if not t: continue
-            try: hist = kite.historical_data(t, fr_d, to_d, "day")
-            except Exception: hist = []
-            if not hist or len(hist) < 15: continue
-            closes=[c["close"] for c in hist]
-            highs=[c["high"] for c in hist]; lows=[c["low"] for c in hist]
+            try:
+                hist = kite.historical_data(t, fr_d, to_d, "day")
+            except Exception:
+                hist = []
+            if not hist or len(hist) < 15:
+                continue
+            closes=[float(c["close"]) for c in hist]
+            highs=[float(c["high"]) for c in hist]; lows=[float(c["low"]) for c in hist]
             ema5=_ema(closes[-10:],5); ema10=_ema(closes[-10:],10)
             rsi=_rsi(closes[-15:],14)
             pp,r1,s1=_pivots(highs[-2],lows[-2],closes[-2])
-            px=closes[-1]
+            px=float(closes[-1])
             ta[sym]={"ema5":ema5,"ema10":ema10,"rsi":rsi,"pp":pp,"r1":r1,"s1":s1,"px":px}
             last_px[sym]=px
 
         if DEBUG_SCAN:
-            out["diag"]["ta_count"] = len(ta)
+            # keep only JSON-safe numbers
+            out["diag"]["ta_count"] = int(len(ta))
 
-        # 6) Bucket NFO rows by name; build candidates near ATM with trade_type
+        # group by underlying name & build candidates near ATM with trade_type
         by_name={}
         for r in base:
             nm=r.get("name")
@@ -199,64 +218,70 @@ def run_smc_scan(kite):
                 ttype, why = _trade_type_for_side(
                     side, ta[nm]["ema5"], ta[nm]["ema10"], ta[nm]["px"], ta[nm]["r1"], ta[nm]["s1"], ta[nm]["rsi"]
                 )
-                candidates.append(("NFO:"+r["tradingsymbol"], r, side, ttype, why, nm))
+                candidates.append(("NFO:"+str(r.get("tradingsymbol")), r, side, ttype, why, nm))
 
-        out["diag"]["candidates"] = len(candidates)
+        out["diag"]["candidates"] = int(len(candidates))
         if not candidates:
             out["errors"].append("No option candidates after ring filter")
             return out
 
-        # 7) Quote + rank
+        # quote + score
         quotes={}
         for i in range(0, len(candidates), 60):
             batch=[s for s,_,_,_,_,_ in candidates[i:i+60]]
-            try: quotes.update(kite.quote(batch) or {})
-            except Exception as e: out["errors"].append(f"quote error: {str(e)}")
+            try:
+                q = kite.quote(batch) or {}
+                quotes.update(q)
+            except Exception as e:
+                out["errors"].append(f"quote error: {str(e)}")
 
         picks=[]
         for sym, meta, side, ttype, why, nm in candidates:
             q = quotes.get(sym) or {}
             ltp = float(q.get("last_price") or 0.0)
             lot = int(meta.get("lot_size") or 1)
-            sc  = _score(q, lot, ltp, ttype)
+            sc  = float(_score(q, lot, ltp, ttype))
 
-            # LONG sizing (SHORT margin not modeled → lots=0)
-            lot_cost = ltp * lot
+            lot_cost = ltp*lot
             lots = int(BUDGET // lot_cost) if (ttype=="LONG" and lot_cost>0) else 0
 
-            # TP/SL at ±1.5% of option premium, tick-rounded
+            # TP/SL percent of premium, tick-rounded
             if ttype=="LONG":
                 tp = _tick_round(ltp * (1.0 + TP_PCT_LONG),  TICK_SIZE)
                 sl = _tick_round(ltp * (1.0 - SL_PCT_LONG),  TICK_SIZE)
                 entry_action = "BUY";  exit_action = "SELL"
             else:
-                tp = _tick_round(ltp * (1.0 - TP_PCT_SHORT), TICK_SIZE)  # want premium to fall
-                sl = _tick_round(ltp * (1.0 + SL_PCT_SHORT), TICK_SIZE)  # risk if premium rises
+                tp = _tick_round(ltp * (1.0 - TP_PCT_SHORT), TICK_SIZE)  # want premium down
+                sl = _tick_round(ltp * (1.0 + SL_PCT_SHORT), TICK_SIZE)  # risk if premium up
                 entry_action = "SELL"; exit_action = "BUY"
 
+            # Ensure JSON-safe fields only (str/int/float/bool/None)
             picks.append({
-                "symbol": sym,                          # e.g., "NFO:HINDUNILVR25AUG2700CE"
-                "tradingsymbol": meta.get("tradingsymbol"),
-                "name": nm,
-                "type": side,                           # CE / PE
-                "trade_type": ttype,                    # LONG / SHORT
+                "symbol": sym,                                    # e.g., "NFO:HINDUNILVR25AUG2700CE"
+                "tradingsymbol": str(meta.get("tradingsymbol")),
+                "name": str(nm),
+                "type": str(side),                                # CE / PE
+                "trade_type": str(ttype),                         # LONG / SHORT
                 "strike": float(meta.get("strike")) if meta.get("strike") is not None else None,
-                "expiry": str(_to_date(meta.get("expiry"))) if meta.get("expiry") else None,
-                "ltp": ltp,
-                "lot_size": lot,
+                "expiry": _safe_date_str(meta.get("expiry")),
+                "ltp": float(ltp),
+                "lot_size": int(lot),
                 "score": round(sc, 6),
-                "suggested_lots": lots,
+                "suggested_lots": int(lots),
                 "reason": f"{nm} {side} → {ttype} | {why}",
-                "tp": tp,
-                "sl": sl,
-                "entry_action": entry_action,           # BUY/SELL for entry
-                "exit_action":  exit_action,            # SELL/BUY for exits (TP/SL)
+                "tp": float(tp) if tp is not None else None,
+                "sl": float(sl) if sl is not None else None,
+                "entry_action": entry_action,                     # BUY/SELL for entry
+                "exit_action":  exit_action,                      # SELL/BUY for exits (TP/SL)
             })
 
-        # rank globally; UI buckets by CE/PE + LONG/SHORT
         picks.sort(key=lambda x: x["score"], reverse=True)
         out["picks"] = picks[:50]
         return out
 
     except Exception as e:
-        out["status"]="error"; out["errors"].append(str(e)); return out
+        out["status"]="error"
+        out["errors"].append(str(e))
+        # keep diag JSON-safe
+        out["diag"] = {k: v for k, v in out.get("diag", {}).items() if isinstance(v, (str, int, float, bool)) or v is None}
+        return out
