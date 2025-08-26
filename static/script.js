@@ -1,21 +1,48 @@
+async function loadScan() {
+  const buyList = document.getElementById('buy-list');
+  const sellList = document.getElementById('sell-list');
+  const meta = document.getElementById('meta');
+  const diag = document.getElementById('diag');
+  const errors = document.getElementById('errors');
 
-async function fetchSMC() {
-    const res = await fetch('/api/smc-status');
+  buyList.innerHTML = '<li>Loading…</li>';
+  sellList.innerHTML = '';
+
+  try {
+    const res = await fetch('/api/smc-status', { cache: 'no-store' });
     const data = await res.json();
-    const buyList = document.getElementById('buy-list');
-    const sellList = document.getElementById('sell-list');
+
+    meta.textContent = `Status: ${data.status || 'unknown'} | Time: ${data.ts || ''} | Budget: ₹${data.budget ?? ''}`;
+    diag.textContent = JSON.stringify(data.diag || {}, null, 2);
+    errors.textContent = (data.errors && data.errors.length) ? data.errors.join(' | ') : '';
+
+    const picks = Array.isArray(data.picks) ? data.picks : [];
     buyList.innerHTML = '';
     sellList.innerHTML = '';
-    for (let [symbol, info] of Object.entries(data)) {
-        const li = document.createElement('li');
-        li.innerHTML = `<b>${symbol}</b> – ₹${info.price} (Zone: ${info.zone[0]}–${info.zone[1]})<br>
-        EMA20: ${info.ema20} | EMA50: ${info.ema50} | RSI: ${info.rsi} | Trend: ${info.trend}`;
-        if (info.status.includes("Buy")) {
-            buyList.appendChild(li);
-        } else {
-            sellList.appendChild(li);
-        }
+
+    if (picks.length === 0) {
+      buyList.innerHTML = '<li>No picks returned.</li>';
+      sellList.innerHTML = '<li>No picks returned.</li>';
+      return;
     }
+
+    for (const p of picks) {
+      const li = document.createElement('li');
+      const strike = p.strike != null ? ` ${p.strike}` : '';
+      li.textContent = `${p.name} ${p.type}${strike}  @ ₹${(p.ltp || 0).toFixed(2)}  | lots=${p.suggested_lots} | ${p.reason || ''}`;
+      if ((p.status || '').toLowerCase() === 'buy') {
+        buyList.appendChild(li);
+      } else {
+        sellList.appendChild(li);
+      }
+    }
+
+    if (!buyList.children.length) buyList.innerHTML = '<li>No Buy ideas</li>';
+    if (!sellList.children.length) sellList.innerHTML = '<li>No Sell ideas</li>';
+
+  } catch (e) {
+    buyList.innerHTML = `<li>Error: ${e}</li>`;
+  }
 }
-setInterval(fetchSMC, 60000);
-fetchSMC();
+
+window.addEventListener('load', loadScan);
