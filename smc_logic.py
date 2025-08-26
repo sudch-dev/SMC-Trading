@@ -16,21 +16,48 @@ TP_MULT_SHORT  = float(os.getenv("TP_MULT_SHORT", "0.60"))
 SL_MULT_SHORT  = float(os.getenv("SL_MULT_SHORT", "1.50"))
 
 # Greeks model (annualized)
-RISK_FREE = float(os.getenv("RISK_FREE", "0.07"))        # ~7% India
-DIV_YIELD = float(os.getenv("DIV_YIELD", "0.00"))        # dividend yield for stocks
+RISK_FREE = float(os.getenv("RISK_FREE", "0.07"))
+DIV_YIELD = float(os.getenv("DIV_YIELD", "0.00"))
 
-# --- Greeks gates (tunable) ---
-IV_MIN_LONG   = float(os.getenv("IV_MIN_LONG",  "0.12"))
-IV_MAX_LONG   = float(os.getenv("IV_MAX_LONG",  "0.45"))
-IV_MIN_SHORT  = float(os.getenv("IV_MIN_SHORT", "0.28"))
+# ---------- Dynamic gate regions (in days to expiry) ----------
+NEAR_DAYS = int(os.getenv("NEAR_DAYS", "3"))     # ≤ this → “near” regime
+FAR_DAYS  = int(os.getenv("FAR_DAYS",  "15"))    # ≥ this → “far” regime
 
-DELTA_MIN_CALL = float(os.getenv("DELTA_MIN_CALL", "0.30"))
-DELTA_MAX_CALL = float(os.getenv("DELTA_MAX_CALL", "0.65"))
-DELTA_MIN_PUT  = float(os.getenv("DELTA_MIN_PUT",  "0.30"))
-DELTA_MAX_PUT  = float(os.getenv("DELTA_MAX_PUT",  "0.65"))
+# ---------- LONG gate anchors ----------
+IV_MIN_LONG_NEAR = float(os.getenv("IV_MIN_LONG_NEAR", "0.15"))
+IV_MAX_LONG_NEAR = float(os.getenv("IV_MAX_LONG_NEAR", "0.35"))
+IV_MIN_LONG_FAR  = float(os.getenv("IV_MIN_LONG_FAR",  "0.12"))
+IV_MAX_LONG_FAR  = float(os.getenv("IV_MAX_LONG_FAR",  "0.45"))
 
-GAMMA_MAX = float(os.getenv("GAMMA_MAX", "0.02"))
-THETA_MAX_PCT = float(os.getenv("THETA_MAX_PCT", "0.02"))
+DELTA_MIN_CALL_NEAR = float(os.getenv("DELTA_MIN_CALL_NEAR", "0.40"))
+DELTA_MAX_CALL_NEAR = float(os.getenv("DELTA_MAX_CALL_NEAR", "0.55"))
+DELTA_MIN_CALL_FAR  = float(os.getenv("DELTA_MIN_CALL_FAR",  "0.30"))
+DELTA_MAX_CALL_FAR  = float(os.getenv("DELTA_MAX_CALL_FAR",  "0.65"))
+
+DELTA_MIN_PUT_NEAR  = float(os.getenv("DELTA_MIN_PUT_NEAR",  "0.40"))
+DELTA_MAX_PUT_NEAR  = float(os.getenv("DELTA_MAX_PUT_NEAR",  "0.55"))
+DELTA_MIN_PUT_FAR   = float(os.getenv("DELTA_MIN_PUT_FAR",   "0.30"))
+DELTA_MAX_PUT_FAR   = float(os.getenv("DELTA_MAX_PUT_FAR",   "0.65"))
+
+GAMMA_MAX_NEAR = float(os.getenv("GAMMA_MAX_NEAR", "0.010"))
+GAMMA_MAX_FAR  = float(os.getenv("GAMMA_MAX_FAR",  "0.020"))
+
+THETA_MAX_PCT_NEAR = float(os.getenv("THETA_MAX_PCT_NEAR", "0.015"))
+THETA_MAX_PCT_FAR  = float(os.getenv("THETA_MAX_PCT_FAR",  "0.020"))
+
+# ---------- SHORT gate anchors (minimal hard gates) ----------
+IV_MIN_SHORT_NEAR = float(os.getenv("IV_MIN_SHORT_NEAR", "0.35"))
+IV_MIN_SHORT_FAR  = float(os.getenv("IV_MIN_SHORT_FAR",  "0.28"))
+
+# Avoid selling ATM near expiry (require far-OTM shorts). Relaxes far out.
+DELTA_MAX_SHORT_ABS_NEAR = float(os.getenv("DELTA_MAX_SHORT_ABS_NEAR", "0.25"))
+DELTA_MAX_SHORT_ABS_FAR  = float(os.getenv("DELTA_MAX_SHORT_ABS_FAR",  "1.00"))
+
+# Prefer decent decay near expiry; relax far out.
+THETA_MIN_PCT_NEAR = float(os.getenv("THETA_MIN_PCT_NEAR", "0.020"))
+THETA_MIN_PCT_FAR  = float(os.getenv("THETA_MIN_PCT_FAR",  "0.000"))
+
+# Behavior when Greeks missing
 ALLOW_IF_NO_GREEKS = os.getenv("ALLOW_IF_NO_GREEKS", "0") in ("1", "true", "True")
 
 DEBUG_SCAN = os.getenv("DEBUG_SCAN", "0") in ("1", "true", "True")
@@ -48,9 +75,7 @@ NIFTY50 = [
 CACHE_DIR = Path("/tmp")
 NFO_PATH  = CACHE_DIR / "nfo_slim.json.gz"
 NSE_PATH  = CACHE_DIR / "nse_slim.json.gz"
-
-_TOKEN_CACHE = {}   # symbol -> NSE instrument_token
-
+_TOKEN_CACHE = {}
 
 # ======================= UTILITIES =======================
 def _gz_write(path, obj):
@@ -68,16 +93,12 @@ def _slim_rows_nfo(raw, allow_names):
     out = []
     allow = set(allow_names)
     for r in raw:
-        nm = r.get("name")
-        if nm not in allow:
-            continue
-        it = r.get("instrument_type")
-        if it not in ("CE", "PE"):
-            continue
+        if r.get("name") not in allow: continue
+        if r.get("instrument_type") not in ("CE","PE"): continue
         out.append({
             "tradingsymbol": r.get("tradingsymbol"),
-            "name": nm,
-            "instrument_type": it,
+            "name": r.get("name"),
+            "instrument_type": r.get("instrument_type"),
             "strike": r.get("strike"),
             "expiry": r.get("expiry"),
             "lot_size": r.get("lot_size"),
@@ -85,45 +106,35 @@ def _slim_rows_nfo(raw, allow_names):
     return out
 
 def _slim_rows_nse(raw, allow_syms):
-    need = set(allow_syms)
-    out = []
+    need = set(allow_syms); out=[]
     for r in raw:
         ts = r.get("tradingsymbol")
         if ts in need:
-            out.append({
-                "tradingsymbol": ts,
-                "instrument_token": r.get("instrument_token"),
-            })
-            if len(out) == len(need):
-                break
+            out.append({"tradingsymbol": ts, "instrument_token": r.get("instrument_token")})
+            if len(out)==len(need): break
     return out
 
 def _load_instruments(kite):
     if NFO_PATH.exists() and NSE_PATH.exists():
-        try:
-            return _gz_read(NFO_PATH), _gz_read(NSE_PATH)
-        except Exception:
-            pass
+        try: return _gz_read(NFO_PATH), _gz_read(NSE_PATH)
+        except Exception: pass
     raw_nfo = kite.instruments("NFO") or []
     raw_nse = kite.instruments("NSE") or []
     nfo_rows = _slim_rows_nfo(raw_nfo, NIFTY50)
     nse_rows = _slim_rows_nse(raw_nse, NIFTY50)
     del raw_nfo, raw_nse
-    _gz_write(NFO_PATH, nfo_rows)
-    _gz_write(NSE_PATH, nse_rows)
+    _gz_write(NFO_PATH, nfo_rows); _gz_write(NSE_PATH, nse_rows)
     return nfo_rows, nse_rows
 
 def _map_tokens(nse_rows, symbols):
     global _TOKEN_CACHE
-    if _TOKEN_CACHE:
-        return _TOKEN_CACHE
-    wanted = set(symbols)
+    if _TOKEN_CACHE: return _TOKEN_CACHE
+    wanted=set(symbols)
     for r in nse_rows:
-        tsym = r.get("tradingsymbol")
-        if tsym in wanted:
-            _TOKEN_CACHE[tsym] = r.get("instrument_token")
-            if len(_TOKEN_CACHE) == len(wanted):
-                break
+        ts=r.get("tradingsymbol")
+        if ts in wanted:
+            _TOKEN_CACHE[ts]=r.get("instrument_token")
+            if len(_TOKEN_CACHE)==len(wanted): break
     return _TOKEN_CACHE
 
 def _to_date(obj):
@@ -133,14 +144,14 @@ def _to_date(obj):
 
 def _ema(vals, p):
     if not vals: return None
-    k = 2/(p+1); e = float(vals[0])
-    for v in vals: e = float(v)*k + e*(1-k)
+    k=2/(p+1); e=float(vals[0])
+    for v in vals: e=float(v)*k + e*(1-k)
     return e
 
 def _rsi(closes, p=14):
-    if len(closes) < p+1: return None
+    if len(closes)<p+1: return None
     gains=losses=0.0
-    for i in range(1, p+1):
+    for i in range(1,p+1):
         d=closes[i]-closes[i-1]
         gains += d if d>0 else 0
         losses+= -d if d<0 else 0
@@ -154,23 +165,21 @@ def _pivots(h,l,c):
     return pp,r1,s1
 
 def _next_expiries(rows, n=2):
-    """Return the next n expiries (including today if equal); fallback to last n if none future."""
-    today = date.today()
-    exps = sorted({_to_date(r["expiry"]) for r in rows if r.get("expiry")})
-    fut = [d for d in exps if d and d >= today]
-    if not fut:
-        return exps[-n:] if len(exps) >= n else exps
+    today=date.today()
+    exps=sorted({_to_date(r["expiry"]) for r in rows if r.get("expiry")})
+    fut=[d for d in exps if d and d>=today]
+    if not fut: return exps[-n:] if len(exps)>=n else exps
     return fut[:n]
 
 def _ring(strikes, atm, steps):
     try: i=strikes.index(atm)
     except ValueError: i=min(range(len(strikes)), key=lambda k: abs(strikes[k]-atm))
-    lo=max(0, i-steps); hi=min(len(strikes)-1, i+steps)
+    lo=max(0,i-steps); hi=min(len(strikes)-1,i+steps)
     return set(strikes[lo:hi+1])
 
 def _tick_round(x, tick=0.05):
     if x is None: return None
-    return round(round(float(x)/tick)*tick, 2)
+    return round(round(float(x)/tick)*tick,2)
 
 def _score(q, lot, ltp, trade_type):
     liq = log1p(q.get("volume") or 0)
@@ -178,145 +187,166 @@ def _score(q, lot, ltp, trade_type):
     bb = (d.get("buy") or [{}])[0].get("price")
     ba = (d.get("sell") or [{}])[0].get("price")
     spr = (ba-bb)/ltp if (bb and ba and ltp) else 0.08
-    aff = 1.0 if (trade_type == "LONG" and ltp and (ltp*lot) <= BUDGET) else 0.0
+    aff = 1.0 if (trade_type=="LONG" and ltp and (ltp*lot)<=BUDGET) else 0.0
     return 0.6*liq - 0.3*spr + 0.1*aff
-
 
 # ======================= SMC (TA) DECISION =======================
 def _trade_bias_from_ta(side, ema5, ema10, px, r1, s1, rsi):
     overbought = (rsi is not None and rsi >= 70)
     oversold   = (rsi is not None and rsi <= 30)
-    bull = (ema5 and ema10 and ema5 > ema10) and (px > r1) and (rsi is None or rsi < 70)
-    bear = (ema5 and ema10 and ema5 < ema10) and (px < s1) and (rsi is None or rsi > 30)
-    if side == "CE":
+    bull = (ema5 and ema10 and ema5>ema10) and (px>r1) and (rsi is None or rsi<70)
+    bear = (ema5 and ema10 and ema5<ema10) and (px<s1) and (rsi is None or rsi>30)
+    if side=="CE":
         if bull and not overbought: return "LONG", "Bullish confirmation"
         return "SHORT", "Bullish weak/exhausted"
     else:
         if bear and not oversold: return "LONG", "Bearish confirmation"
         return "SHORT", "Bearish weak/exhausted"
 
-
 # ======================= BLACK-SCHOLES / GREEKS =======================
 try:
     from math import erf
 except ImportError:
     def erf(x):
-        sign = 1 if x >= 0 else -1
-        x = abs(x)
-        a1,a2,a3,a4,a5 = 0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429
-        t = 1.0/(1.0+0.3275911*x)
-        y = 1 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t*exp(-x*x)
+        sign=1 if x>=0 else -1; x=abs(x)
+        a1,a2,a3,a4,a5=0.254829592,-0.284496736,1.421413741,-1.453152027,1.061405429
+        t=1.0/(1.0+0.3275911*x)
+        y=1-((((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*exp(-x*x))
         return sign*y
 
-def _phi(x):  return (1.0 / (sqrt(2.0*3.141592653589793))) * exp(-0.5*x*x)
-def _Phi(x):  return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+def _phi(x): return (1.0/(sqrt(2.0*3.141592653589793)))*exp(-0.5*x*x)
+def _Phi(x): return 0.5*(1.0+erf(x/sqrt(2.0)))
 
 def _yearfrac(start_dt, end_dt):
-    days = max(0.0, (end_dt.date() - start_dt.date()).days)
+    days=max(0.0,(end_dt.date()-start_dt.date()).days)
     return max(1.0/365.0, days/365.0)
 
-def bs_price(side, S, K, T, r=RISK_FREE, q=DIV_YIELD, sigma=0.2):
-    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0: return None
-    d1 = (log(S/K) + (r - q + 0.5*sigma*sigma)*T) / (sigma*sqrt(T))
-    d2 = d1 - sigma*sqrt(T)
-    disc_r, disc_q = exp(-r*T), exp(-q*T)
-    if side == "CE": return disc_q*S*_Phi(d1) - disc_r*K*_Phi(d2)
-    else:            return disc_r*K*_Phi(-d2) - disc_q*S*_Phi(-d1)
+def _days_to_expiry(now_dt, exp_dt):
+    return max(0, (exp_dt.date()-now_dt.date()).days)
 
-def bs_greeks(side, S, K, T, r=RISK_FREE, q=DIV_YIELD, sigma=0.2):
-    if S <= 0 or K <= 0 or T <= 0 or sigma is None or sigma <= 0:
-        return {k: None for k in ("delta","gamma","theta","vega","rho")}
-    d1 = (log(S/K) + (r - q + 0.5*sigma*sigma)*T) / (sigma*sqrt(T))
-    d2 = d1 - sigma*sqrt(T)
-    disc_r, disc_q = exp(-r*T), exp(-q*T)
-    pdf = _phi(d1)
-    if side == "CE":
-        delta = disc_q * _Phi(d1)
-        theta = ( - (disc_q*S*pdf*sigma)/(2*sqrt(T)) - r*disc_r*K*_Phi(d2) + q*disc_q*S*_Phi(d1) )
-        rho   =  K*T*disc_r*_Phi(d2)
+def bs_price(side,S,K,T,r=RISK_FREE,q=DIV_YIELD,sigma=0.2):
+    if S<=0 or K<=0 or T<=0 or sigma<=0: return None
+    d1=(log(S/K)+(r-q+0.5*sigma*sigma)*T)/(sigma*sqrt(T))
+    d2=d1 - sigma*sqrt(T)
+    disc_r,disc_q=exp(-r*T),exp(-q*T)
+    if side=="CE": return disc_q*S*_Phi(d1) - disc_r*K*_Phi(d2)
+    else:          return disc_r*K*_Phi(-d2) - disc_q*S*_Phi(-d1)
+
+def bs_greeks(side,S,K,T,r=RISK_FREE,q=DIV_YIELD,sigma=0.2):
+    if S<=0 or K<=0 or T<=0 or sigma is None or sigma<=0:
+        return {k:None for k in("delta","gamma","theta","vega","rho")}
+    d1=(log(S/K)+(r-q+0.5*sigma*sigma)*T)/(sigma*sqrt(T))
+    d2=d1 - sigma*sqrt(T)
+    disc_r,disc_q=exp(-r*T),exp(-q*T)
+    pdf=_phi(d1)
+    if side=="CE":
+        delta=disc_q*_Phi(d1)
+        theta=( -(disc_q*S*pdf*sigma)/(2*sqrt(T)) - r*disc_r*K*_Phi(d2) + q*disc_q*S*_Phi(d1) )
+        rho  = K*T*disc_r*_Phi(d2)
     else:
-        delta = -disc_q * _Phi(-d1)
-        theta = ( - (disc_q*S*pdf*sigma)/(2*sqrt(T)) + r*disc_r*K*_Phi(-d2) - q*disc_q*S*_Phi(-d1) )
-        rho   = -K*T*disc_r*_Phi(-d2)
-    gamma = disc_q * pdf / (S*sigma*sqrt(T))
-    vega  = disc_q * S * pdf * sqrt(T)
-    return {"delta": float(delta), "gamma": float(gamma),
-            "theta": float(theta/365.0),      # per day
-            "vega":  float(vega/100.0),       # per +1.00 vol
-            "rho":   float(rho/100.0)}        # per +1.00 rate
+        delta=-disc_q*_Phi(-d1)
+        theta=( -(disc_q*S*pdf*sigma)/(2*sqrt(T)) + r*disc_r*K*_Phi(-d2) - q*disc_q*S*_Phi(-d1) )
+        rho  = -K*T*disc_r*_Phi(-d2)
+    gamma = disc_q*pdf/(S*sigma*sqrt(T))
+    vega  = disc_q*S*pdf*sqrt(T)
+    return {"delta":float(delta), "gamma":float(gamma),
+            "theta":float(theta/365.0), "vega":float(vega/100.0), "rho":float(rho/100.0)}
 
-def implied_vol(side, S, K, T, price, r=RISK_FREE, q=DIV_YIELD, lo=1e-4, hi=5.0, tol=1e-4, max_iter=60):
-    if price is None or price <= 0 or S <= 0 or K <= 0 or T <= 0: return None
-    # Expand bracket if needed
+def implied_vol(side,S,K,T,price,r=RISK_FREE,q=DIV_YIELD,lo=1e-4,hi=5.0,tol=1e-4,max_iter=60):
+    if price is None or price<=0 or S<=0 or K<=0 or T<=0: return None
     for _ in range(10):
-        plo = bs_price(side, S, K, T, r, q, lo)
-        phi = bs_price(side, S, K, T, r, q, hi)
+        plo=bs_price(side,S,K,T,r,q,lo); phi=bs_price(side,S,K,T,r,q,hi)
         if plo is None or phi is None: return None
-        if (plo - price) * (phi - price) <= 0: break
-        hi *= 1.5
-        if hi > 10: break
-    a,b = lo,hi
-    fa = bs_price(side,S,K,T,r,q,a) - price
-    fb = bs_price(side,S,K,T,r,q,b) - price
-    if fa*fb > 0: return None
+        if (plo-price)*(phi-price)<=0: break
+        hi*=1.5
+        if hi>10: break
+    a,b=lo,hi
+    fa=bs_price(side,S,K,T,r,q,a)-price
+    fb=bs_price(side,S,K,T,r,q,b)-price
+    if fa*fb>0: return None
     for _ in range(max_iter):
-        m  = 0.5*(a+b)
-        fm = bs_price(side,S,K,T,r,q,m) - price
-        if abs(fm) < tol: return float(m)
-        if fa*fm <= 0: b,fb = m,fm
-        else:         a,fa = m,fm
+        m=0.5*(a+b)
+        fm=bs_price(side,S,K,T,r,q,m)-price
+        if abs(fm)<tol: return float(m)
+        if fa*fm<=0: b,fb=m,fm
+        else: a,fa=m,fm
     return float(0.5*(a+b))
 
+# ======================= DYNAMIC GATES =======================
+def _lerp(a, b, w):
+    return a + (b - a) * w
 
-# ======================= GREEK-AWARE SMC =======================
-def _apply_greeks_gates(side, base_trade_type, ltp, iv, greeks):
+def _blend_weight(days):
+    if days <= NEAR_DAYS: return 0.0
+    if days >= FAR_DAYS:  return 1.0
+    return (days - NEAR_DAYS) / max(1.0, (FAR_DAYS - NEAR_DAYS))
+
+def _dynamic_params(days):
+    w = _blend_weight(days)
+    return {
+        # LONG bands
+        "iv_min_long": _lerp(IV_MIN_LONG_NEAR, IV_MIN_LONG_FAR, w),
+        "iv_max_long": _lerp(IV_MAX_LONG_NEAR, IV_MAX_LONG_FAR, w),
+        "delta_min_call": _lerp(DELTA_MIN_CALL_NEAR, DELTA_MIN_CALL_FAR, w),
+        "delta_max_call": _lerp(DELTA_MAX_CALL_NEAR, DELTA_MAX_CALL_FAR, w),
+        "delta_min_put":  _lerp(DELTA_MIN_PUT_NEAR,  DELTA_MIN_PUT_FAR,  w),
+        "delta_max_put":  _lerp(DELTA_MAX_PUT_NEAR,  DELTA_MAX_PUT_FAR,  w),
+        "gamma_max":      _lerp(GAMMA_MAX_NEAR,      GAMMA_MAX_FAR,      w),
+        "theta_max_pct":  _lerp(THETA_MAX_PCT_NEAR,  THETA_MAX_PCT_FAR,  w),
+
+        # SHORT minimal gates
+        "iv_min_short":        _lerp(IV_MIN_SHORT_NEAR, IV_MIN_SHORT_FAR, w),
+        "delta_max_short_abs": _lerp(DELTA_MAX_SHORT_ABS_NEAR, DELTA_MAX_SHORT_ABS_FAR, w),
+        "theta_min_pct":       _lerp(THETA_MIN_PCT_NEAR, THETA_MIN_PCT_FAR, w),
+    }
+
+# ======================= GREEK-AWARE SMC (Dynamic) =======================
+def _apply_greeks_gates(side, base_trade_type, ltp, iv, greeks, days, params):
     if iv is None or greeks.get("delta") is None:
         if ALLOW_IF_NO_GREEKS:
-            return base_trade_type, "Greeks missing (allowed)", True
-        return "SHORT" if base_trade_type=="LONG" else base_trade_type, "Greeks missing (blocked long)", False
+            return base_trade_type, f"Greeks missing (allowed) dte={days}", True
+        return ("SHORT" if base_trade_type=="LONG" else base_trade_type,
+                f"Greeks missing (blocked long) dte={days}", False)
 
     delta = greeks.get("delta") or 0.0
     gamma = greeks.get("gamma") or 0.0
-    theta = greeks.get("theta") or 0.0  # per day
-
-    theta_bleed_pct = abs(theta) / max(ltp, 1e-9)
-
-    ok = True
-    fails = []
+    theta = greeks.get("theta") or 0.0
+    theta_pct = abs(theta)/max(ltp,1e-9)
 
     if base_trade_type == "LONG":
-        # IV range
-        if not (IV_MIN_LONG <= iv <= IV_MAX_LONG):
-            ok = False; fails.append(f"IV {iv:.2f} ∉ [{IV_MIN_LONG:.2f},{IV_MAX_LONG:.2f}]")
-        # Delta band
-        if side == "CE":
-            if not (DELTA_MIN_CALL <= delta <= DELTA_MAX_CALL):
-                ok = False; fails.append(f"Δ {delta:.2f} (call band {DELTA_MIN_CALL}-{DELTA_MAX_CALL})")
+        fails=[]
+        if not (params["iv_min_long"] <= iv <= params["iv_max_long"]):
+            fails.append(f"IV {iv:.2f}∉[{params['iv_min_long']:.2f},{params['iv_max_long']:.2f}]")
+        if side=="CE":
+            if not (params["delta_min_call"] <= delta <= params["delta_max_call"]):
+                fails.append(f"Δ {delta:.2f} (call band {params['delta_min_call']:.2f}-{params['delta_max_call']:.2f})")
         else:
-            if not (DELTA_MIN_PUT <= abs(delta) <= DELTA_MAX_PUT):
-                ok = False; fails.append(f"|Δ| {abs(delta):.2f} (put band {DELTA_MIN_PUT}-{DELTA_MAX_PUT})")
-        # Gamma cap
-        if gamma > GAMMA_MAX:
-            ok = False; fails.append(f"Γ {gamma:.4f} > {GAMMA_MAX}")
-        # Theta bleed
-        if theta_bleed_pct > THETA_MAX_PCT:
-            ok = False; fails.append(f"θ {theta_bleed_pct:.2%} > {THETA_MAX_PCT:.2%}/day")
-
-        if ok:
-            return "LONG", "Greeks ok", True
+            if not (params["delta_min_put"] <= abs(delta) <= params["delta_max_put"]):
+                fails.append(f"|Δ| {abs(delta):.2f} (put band {params['delta_min_put']:.2f}-{params['delta_max_put']:.2f})")
+        if gamma > params["gamma_max"]:
+            fails.append(f"Γ {gamma:.4f}>{params['gamma_max']:.4f}")
+        if theta_pct > params["theta_max_pct"]:
+            fails.append(f"θ {theta_pct:.2%}>{params['theta_max_pct']:.2%}/day")
+        if not fails:
+            return "LONG", f"Greeks ok (dte={days})", True
         else:
-            return "SHORT", "Greeks fail: " + "; ".join(fails), False
+            return "SHORT", f"Greeks fail: {'; '.join(fails)} (dte={days})", False
 
-    else:  # base SHORT
-        if iv < IV_MIN_SHORT:
-            ok = False; fails.append(f"IV {iv:.2f} < {IV_MIN_SHORT:.2f}")
-        if gamma > GAMMA_MAX:
-            ok = False; fails.append(f"Γ {gamma:.4f} > {GAMMA_MAX}")
-        if ok:
-            return "SHORT", "Greeks favor short", True
-        else:
-            return "SHORT", "Weak short (Greeks fail: " + "; ".join(fails) + ")", False
+    # SHORT (minimal hard gates + near-expiry protections)
+    fails=[]
+    if iv < params["iv_min_short"]:
+        fails.append(f"IV {iv:.2f}<{params['iv_min_short']:.2f}")
+    if gamma > params["gamma_max"]:
+        fails.append(f"Γ {gamma:.4f}>{params['gamma_max']:.4f}")
+    if abs(delta) > params["delta_max_short_abs"]:
+        fails.append(f"|Δ| {abs(delta):.2f}>{params['delta_max_short_abs']:.2f} (avoid ATM short)")
+    if theta_pct < params["theta_min_pct"]:
+        fails.append(f"θ {theta_pct:.2%}<{params['theta_min_pct']:.2%}/day")
 
+    if not fails:
+        return "SHORT", f"Greeks favor short (dte={days})", True
+    else:
+        return "SHORT", f"Weak short: {'; '.join(fails)} (dte={days})", False
 
 # ======================= MAIN SCAN =======================
 def run_smc_scan(kite):
@@ -325,33 +355,28 @@ def run_smc_scan(kite):
     try:
         nfo, nse = _load_instruments(kite)
         out["diag"]["nfo_filtered"]=len(nfo)
-
         if not nfo:
             out["status"]="error"; out["errors"].append("No NFO rows for NIFTY50"); return out
 
-        # ---- use next two expiries ----
+        # next two expiries
         exps = _next_expiries(nfo, n=2)
         out["diag"]["expiries"] = [str(e) for e in exps]
         if not exps:
             out["status"]="error"; out["errors"].append("No upcoming expiries"); return out
         base = [r for r in nfo if r.get("expiry") and _to_date(r["expiry"]) in exps]
 
-        # token map for underlying stocks (NSE)
+        # token map
         tokens = _map_tokens(nse, NIFTY50)
 
         # TA per stock (daily)
-        ta = {}
-        last_px = {}
-        to_d = datetime.now(); fr_d = to_d - timedelta(days=40)
+        ta = {}; last_px={}
+        to_d=datetime.now(); fr_d=to_d - timedelta(days=40)
         for sym in NIFTY50:
-            t = tokens.get(sym)
+            t=tokens.get(sym)
             if not t: continue
-            try:
-                hist = kite.historical_data(t, fr_d, to_d, "day")
-            except Exception:
-                hist = []
-            if not hist or len(hist) < 15:
-                continue
+            try: hist=kite.historical_data(t, fr_d, to_d, "day")
+            except Exception: hist=[]
+            if not hist or len(hist)<15: continue
             closes=[c["close"] for c in hist]
             highs=[c["high"] for c in hist]; lows=[c["low"] for c in hist]
             ema5=_ema(closes[-10:],5); ema10=_ema(closes[-10:],10)
@@ -361,30 +386,27 @@ def run_smc_scan(kite):
             ta[sym]={"ema5":ema5,"ema10":ema10,"rsi":rsi,"pp":pp,"r1":r1,"s1":s1,"px":px}
             last_px[sym]=px
 
-        if DEBUG_SCAN:
-            out["diag"]["ta_count"]=len(ta)
+        if DEBUG_SCAN: out["diag"]["ta_count"]=len(ta)
 
-        # bucket NFO rows by underlying name
-        by_name = {}
+        # bucket by underlying
+        by_name={}
         for r in base:
-            nm = r.get("name")
-            if nm not in ta:
-                continue
-            by_name.setdefault(nm, []).append(r)
+            nm=r.get("name")
+            if nm not in ta: continue
+            by_name.setdefault(nm,[]).append(r)
 
-        # Build candidate list near ATM
-        candidates = []
+        # Build candidates near ATM
+        candidates=[]
         for nm, rows in by_name.items():
-            strikes = sorted({r.get("strike") for r in rows if r.get("strike") is not None})
+            strikes=sorted({r.get("strike") for r in rows if r.get("strike") is not None})
             if not strikes: continue
-            px = last_px.get(nm)
-            atm = min(strikes, key=lambda s: abs(s - px)) if px else strikes[len(strikes)//2]
-            ring = _ring(strikes, atm, RING_STRIKES)
-
+            px=last_px.get(nm)
+            atm=min(strikes, key=lambda s: abs(s-px)) if px else strikes[len(strikes)//2]
+            ring=_ring(strikes, atm, RING_STRIKES)
             for r in rows:
                 if r.get("strike") not in ring: continue
-                side = r.get("instrument_type")
-                base_type, rationale = _trade_bias_from_ta(
+                side=r.get("instrument_type")
+                base_type, rationale=_trade_bias_from_ta(
                     side, ta[nm]["ema5"], ta[nm]["ema10"], ta[nm]["px"], ta[nm]["r1"], ta[nm]["s1"], ta[nm]["rsi"]
                 )
                 candidates.append(("NFO:"+r["tradingsymbol"], r, side, base_type, rationale, nm))
@@ -395,58 +417,57 @@ def run_smc_scan(kite):
             return out
 
         # Quote in batches
-        quotes = {}
-        for i in range(0, len(candidates), 60):
+        quotes={}
+        for i in range(0,len(candidates),60):
             batch=[s for s,_,_,_,_,_ in candidates[i:i+60]]
-            try:
-                quotes.update(kite.quote(batch) or {})
-            except Exception as e:
-                out["errors"].append(f"quote error: {str(e)}")
+            try: quotes.update(kite.quote(batch) or {})
+            except Exception as e: out["errors"].append(f"quote error: {str(e)}")
 
-        # Score + Greeks-aware decision
-        scored = []
+        # Score + Dynamic Greeks-aware decision
+        scored=[]
         for sym, meta, side, base_type, rationale, nm in candidates:
-            q = quotes.get(sym) or {}
-            ltp = float(q.get("last_price") or 0.0)
-            lot = int(meta.get("lot_size") or 1)
-            sc  = _score(q, lot, ltp, base_type)
+            q=quotes.get(sym) or {}
+            ltp=float(q.get("last_price") or 0.0)
+            lot=int(meta.get("lot_size") or 1)
+            sc=_score(q, lot, ltp, base_type)
 
-            # ---- IV + Greeks inputs ----
-            S   = float(last_px.get(nm) or 0.0)
-            K   = float(meta.get("strike") or 0.0)
-            now  = datetime.now()
-            expd = _to_date(meta.get("expiry"))
-            exp_dt = datetime.combine(expd, datetime.min.time()) if hasattr(expd, "year") else now
-            T   = _yearfrac(now, exp_dt)
+            # IV + Greeks inputs
+            S=float(last_px.get(nm) or 0.0)
+            K=float(meta.get("strike") or 0.0)
+            now=datetime.now()
+            expd=_to_date(meta.get("expiry"))
+            exp_dt=datetime.combine(expd, datetime.min.time()) if hasattr(expd,"year") else now
+            T=_yearfrac(now, exp_dt)
+            dte=_days_to_expiry(now, exp_dt)
 
-            iv  = implied_vol(side, S, K, T, ltp) if (S>0 and K>0 and T>0 and ltp>0) else None
-            gks = bs_greeks(side, S, K, T, sigma=iv) if iv else {k: None for k in ("delta","gamma","theta","vega","rho")}
+            iv=implied_vol(side, S, K, T, ltp) if (S>0 and K>0 and T>0 and ltp>0) else None
+            gks=bs_greeks(side, S, K, T, sigma=iv) if iv else {k:None for k in("delta","gamma","theta","vega","rho")}
 
-            # ---- Apply Greeks gates on top of TA bias ----
-            final_type, greek_note, _passed = _apply_greeks_gates(side, base_type, ltp, iv, gks)
+            # Dynamic gates based on dte
+            params=_dynamic_params(dte)
+            final_type, greek_note, _passed = _apply_greeks_gates(side, base_type, ltp, iv, gks, dte, params)
 
-            # ---- sizing (longs only) ----
-            lot_cost = ltp * lot
-            lots = int(BUDGET // lot_cost) if (final_type=="LONG" and lot_cost>0) else 0
+            # sizing (longs only)
+            lot_cost=ltp*lot
+            lots=int(BUDGET // lot_cost) if (final_type=="LONG" and lot_cost>0) else 0
 
-            # ---- TP/SL & actions ----
-            if final_type == "LONG":
-                tp = _tick_round(ltp * TP_MULT_LONG)
-                sl = _tick_round(ltp * SL_MULT_LONG)
-                entry_action, exit_action = "BUY", "SELL"
+            # TP/SL & actions
+            if final_type=="LONG":
+                tp=_tick_round(ltp*TP_MULT_LONG);  sl=_tick_round(ltp*SL_MULT_LONG)
+                entry_action, exit_action="BUY","SELL"
             else:
-                tp = _tick_round(ltp * TP_MULT_SHORT)
-                sl = _tick_round(ltp * SL_MULT_SHORT)
-                entry_action, exit_action = "SELL", "BUY"
+                tp=_tick_round(ltp*TP_MULT_SHORT); sl=_tick_round(ltp*SL_MULT_SHORT)
+                entry_action, exit_action="SELL","BUY"
 
             scored.append({
                 "symbol": sym,
                 "tradingsymbol": meta.get("tradingsymbol"),
                 "name": nm,
                 "type": side,
-                "trade_type": final_type,              # LONG/SHORT after Greeks
+                "trade_type": final_type,     # LONG/SHORT after dynamic Greeks gates
                 "strike": float(meta.get("strike")) if meta.get("strike") is not None else None,
                 "expiry": str(_to_date(meta.get("expiry"))) if meta.get("expiry") else None,
+                "dte_days": int(dte),
                 "ltp": float(ltp),
                 "lot_size": int(lot),
                 "score": round(sc,6),
@@ -462,11 +483,13 @@ def run_smc_scan(kite):
                 "theta_per_day": gks.get("theta"),
                 "vega_per_volpt": gks.get("vega"),
                 "rho_per_ratept": gks.get("rho"),
+                "dyn_gate": params if DEBUG_SCAN else None,
             })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        out["picks"] = scored[:50]
+        out["picks"]=scored[:50]
         return out
 
     except Exception as e:
         out["status"]="error"; out["errors"].append(str(e)); return out
+        
