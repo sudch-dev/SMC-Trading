@@ -1,11 +1,13 @@
 import os
 from datetime import datetime, date, timedelta
 from math import log1p
+import json, gzip
+from pathlib import Path
 
 # ---------------- Config ----------------
-BUDGET = float(os.getenv("BUDGET", "10000"))             # full budget per pick (we don't split)
+BUDGET = float(os.getenv("BUDGET", "10000"))             # budget per pick
 RING_STRIKES = int(os.getenv("RING_STRIKES", "4"))       # strikes each side of ATM
-MAX_STOCKS = int(os.getenv("MAX_STOCKS", "50"))          # cap universe (50 = all NIFTY50)
+MAX_STOCKS = int(os.getenv("MAX_STOCKS", "50"))          # cap universe
 
 # TP/SL heuristics (option premium multiples)
 TP_MULT_LONG   = float(os.getenv("TP_MULT_LONG", "1.50"))
@@ -21,20 +23,91 @@ NIFTY50 = [
     "ASIANPAINT","ADANIENT","HCLTECH","MARUTI","BAJFINANCE","SUNPHARMA","TITAN","ULTRACEMCO","NTPC","WIPRO",
     "NESTLEIND","ONGC","M&M","POWERGRID","JSWSTEEL","TATASTEEL","COALINDIA","HINDUNILVR","BAJAJFINSV","TECHM",
     "GRASIM","HDFCLIFE","DIVISLAB","BRITANNIA","DRREDDY","INDUSINDBK","TATAMOTORS","BAJAJ-AUTO","HEROMOTOCO","CIPLA",
-    "EICHERMOT","LTIM","HINDALCO","BPCL","ADANIPORTS","SHRIRAMFIN","UPL","APOLLOHOSP","LT","BRITANNIA"  # (keep 50; one duplicate replaced by LT)
+    "EICHERMOT","LTIM","HINDALCO","BPCL","ADANIPORTS","SHRIRAMFIN","UPL","APOLLOHOSP","LT","BRITANNIA"
 ][:MAX_STOCKS]
 
-# --------- Caches ---------
-_INSTR_CACHE = {"loaded": False, "nfo": [], "nse": []}
+# --------- Caches (RAM-light with /tmp gz) ---------
+CACHE_DIR = Path("/tmp")
+NFO_PATH  = CACHE_DIR / "nfo_slim.json.gz"
+NSE_PATH  = CACHE_DIR / "nse_slim.json.gz"
+
 _TOKEN_CACHE = {}   # symbol -> NSE instrument_token
 
+
 # --------- Utilities ---------
+def _gz_write(path, obj):
+    try:
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+def _gz_read(path):
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return json.load(f)
+
+def _slim_rows_nfo(raw, allow_names):
+    """Keep only tiny fields and only for our 50 names & CE/PE."""
+    out = []
+    allow = set(allow_names)
+    for r in raw:
+        nm = r.get("name")
+        if nm not in allow:
+            continue
+        it = r.get("instrument_type")
+        if it not in ("CE", "PE"):
+            continue
+        out.append({
+            "tradingsymbol": r.get("tradingsymbol"),
+            "name": nm,
+            "instrument_type": it,
+            "strike": r.get("strike"),
+            "expiry": r.get("expiry"),
+            "lot_size": r.get("lot_size"),
+        })
+    return out
+
+def _slim_rows_nse(raw, allow_syms):
+    """Only keep token mapping for the 50 underlyings."""
+    need = set(allow_syms)
+    out = []
+    for r in raw:
+        ts = r.get("tradingsymbol")
+        if ts in need:
+            out.append({
+                "tradingsymbol": ts,
+                "instrument_token": r.get("instrument_token"),
+            })
+            if len(out) == len(need):
+                break
+    return out
+
 def _load_instruments(kite):
-    if not _INSTR_CACHE["loaded"]:
-        _INSTR_CACHE["nfo"] = kite.instruments("NFO") or []
-        _INSTR_CACHE["nse"] = kite.instruments("NSE") or []
-        _INSTR_CACHE["loaded"] = True
-    return _INSTR_CACHE["nfo"], _INSTR_CACHE["nse"]
+    """
+    Returns: (nfo_slim_rows, nse_slim_rows)
+    • First call per dyno: fetch full dumps, slim, gzip to /tmp.
+    • Subsequent calls: read small gz files (fast, low-RAM).
+    """
+    if NFO_PATH.exists() and NSE_PATH.exists():
+        try:
+            return _gz_read(NFO_PATH), _gz_read(NSE_PATH)
+        except Exception:
+            # fall back to refetch
+            pass
+
+    raw_nfo = kite.instruments("NFO") or []
+    raw_nse = kite.instruments("NSE") or []
+
+    nfo_rows = _slim_rows_nfo(raw_nfo, NIFTY50)
+    nse_rows = _slim_rows_nse(raw_nse, NIFTY50)
+
+    # free heavy lists ASAP
+    del raw_nfo, raw_nse
+
+    _gz_write(NFO_PATH, nfo_rows)
+    _gz_write(NSE_PATH, nse_rows)
+    return nfo_rows, nse_rows
+
 
 def _map_tokens(nse_rows, symbols):
     global _TOKEN_CACHE
@@ -114,30 +187,30 @@ def _trade_type_for_side(side, ema5, ema10, px, r1, s1, rsi):
         if bear and not oversold: return "LONG", "Bearish confirmation"
         return "SHORT", "Bearish weak/exhausted"
 
+
 # ---------------- Main Scan ----------------
 def run_smc_scan(kite):
     out = {"status":"ok","ts":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
            "budget":BUDGET,"picks":[],"errors":[],"diag":{}}
     try:
         nfo, nse = _load_instruments(kite)
-        # filter to stock options for NIFTY50 names
-        base = [r for r in nfo if r.get("name") in NIFTY50 and r.get("instrument_type") in ("CE","PE")]
-        out["diag"]["nfo_total"]=len(nfo); out["diag"]["nfo_filtered"]=len(base)
-        if not base:
+        out["diag"]["nfo_filtered"]=len(nfo)
+
+        if not nfo:
             out["status"]="error"; out["errors"].append("No NFO rows for NIFTY50"); return out
 
         # nearest expiry
-        exp = _nearest_expiry(base)
+        exp = _nearest_expiry(nfo)
         out["diag"]["expiry"]=str(exp) if exp else None
         if not exp:
             out["status"]="error"; out["errors"].append("No upcoming expiry"); return out
-        base = [r for r in base if r.get("expiry") and _to_date(r["expiry"])==exp]
+        base = [r for r in nfo if r.get("expiry") and _to_date(r["expiry"])==exp]
 
         # token map for underlying stocks (NSE)
         tokens = _map_tokens(nse, NIFTY50)
 
         # TA per stock
-        ta = {}      # sym -> dict
+        ta = {}
         last_px = {}
         to_d = datetime.now(); fr_d = to_d - timedelta(days=40)
         for sym in NIFTY50:
@@ -165,7 +238,7 @@ def run_smc_scan(kite):
         by_name = {}
         for r in base:
             nm = r.get("name")
-            if nm not in ta:   # skip names without TA (no token or data)
+            if nm not in ta:
                 continue
             by_name.setdefault(nm, []).append(r)
 
@@ -213,24 +286,23 @@ def run_smc_scan(kite):
             lot_cost = ltp * lot
             lots = int(BUDGET // lot_cost) if (trade_type=="LONG" and lot_cost>0) else 0
 
-            # TP/SL suggestion on option premium
             if trade_type == "LONG":
                 tp = _tick_round(ltp * TP_MULT_LONG)
                 sl = _tick_round(ltp * SL_MULT_LONG)
                 entry_action = "BUY"
                 exit_action = "SELL"
             else:
-                tp = _tick_round(ltp * TP_MULT_SHORT)  # lower than entry premium ideally
-                sl = _tick_round(ltp * SL_MULT_SHORT)  # higher than entry premium
+                tp = _tick_round(ltp * TP_MULT_SHORT)
+                sl = _tick_round(ltp * SL_MULT_SHORT)
                 entry_action = "SELL"
                 exit_action = "BUY"
 
             scored.append({
-                "symbol": sym,                          # "NFO:XXX..."
+                "symbol": sym,
                 "tradingsymbol": meta.get("tradingsymbol"),
                 "name": nm,
-                "type": side,                           # CE / PE
-                "trade_type": trade_type,               # LONG / SHORT
+                "type": side,
+                "trade_type": trade_type,
                 "strike": float(meta.get("strike")) if meta.get("strike") is not None else None,
                 "expiry": str(_to_date(meta.get("expiry"))) if meta.get("expiry") else None,
                 "ltp": float(ltp),
@@ -238,16 +310,14 @@ def run_smc_scan(kite):
                 "score": round(sc,6),
                 "suggested_lots": lots,
                 "reason": f"{nm} {side} → {trade_type} | {rationale}",
-                # TP/SL suggestion (option price)
                 "tp": tp,
                 "sl": sl,
-                "entry_action": entry_action,           # BUY/SELL for entry
-                "exit_action": exit_action,             # SELL/BUY for exits (TP/SL)
+                "entry_action": entry_action,
+                "exit_action": exit_action,
             })
 
-        # Rank globally; return top set (you can paginate in UI)
         scored.sort(key=lambda x: x["score"], reverse=True)
-        out["picks"] = scored[:50]  # give enough; UI can show top per bucket
+        out["picks"] = scored[:50]
         return out
 
     except Exception as e:
