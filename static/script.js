@@ -1,29 +1,3 @@
-function rowHTML(p) {
-  const strike = p.strike != null ? ` ${p.strike}` : '';
-  const lots = p.suggested_lots ?? 0;
-  const qty = lots * (p.lot_size || 1);
-  const tp = p.tp != null ? p.tp.toFixed(2) : '—';
-  const sl = p.sl != null ? p.sl.toFixed(2) : '—';
-
-  return `
-    <div class="row">
-      <div><strong>${p.name} ${p.type}${strike}</strong>
-        <span class="pill">${p.trade_type}</span>
-      </div>
-      <div class="muted">LTP ₹${(p.ltp||0).toFixed(2)} • Lot ${p.lot_size}</div>
-      <div class="muted">TP ₹${tp} • SL ₹${sl}</div>
-      <div class="muted">Why: ${p.reason || ''}</div>
-      <div class="row">
-        <label>Lots:</label>
-        <input type="number" min="0" step="1" value="${lots}" data-sym="${p.symbol}" data-lot="${p.lot_size}"
-               data-action="${p.entry_action || (p.trade_type === 'LONG' ? 'BUY' : 'SELL')}"
-               data-tp="${p.tp || ''}" data-sl="${p.sl || ''}">
-        <button class="btn" onclick="execOrder(this)">Execute (with TP/SL)</button>
-      </div>
-    </div>
-  `;
-}
-
 async function execOrder(btn) {
   const input = btn.previousElementSibling;
   const lots = parseInt(input.value || '0', 10);
@@ -40,7 +14,10 @@ async function execOrder(btn) {
   const tp = parseFloat(input.getAttribute('data-tp') || 'NaN');
   const sl = parseFloat(input.getAttribute('data-sl') || 'NaN');
 
-  if (!confirm(`Place ${action} ${qty} of ${symbol}?\nTP: ${isNaN(tp)?'—':tp}\nSL: ${isNaN(sl)?'—':sl}`)) return;
+  if (!confirm(`Place ${action} ${qty} of ${symbol}?\nTP: ${isNaN(tp)?'—':tp}\nSL: ${isNaN(sl)?'—':sl}\n(Entry will be LIMIT; server picks price)`)) return;
+
+  // optional UX: prevent double-clicks
+  btn.disabled = true; btn.textContent = 'Placing…';
 
   try {
     const res = await fetch('/api/execute', {
@@ -50,7 +27,8 @@ async function execOrder(btn) {
         symbol,
         action,
         quantity: qty,
-        order_type: 'MARKET',
+        order_type: 'LIMIT',      // ← IMPORTANT: always LIMIT now
+        // price: omit → backend computes from best bid/ask or ltp fallback
         with_tp_sl: true,
         tp: isNaN(tp) ? null : tp,
         sl: isNaN(sl) ? null : sl,
@@ -58,53 +36,24 @@ async function execOrder(btn) {
       })
     });
     const data = await res.json();
-    alert(JSON.stringify(data, null, 2));
+
+    if (data.status === 'ok') {
+      const lines = [
+        `Entry OK`,
+        `Order: ${data.entry_order_id}`,
+        `Used LIMIT: ₹${data.used_limit_price ?? '—'}`
+      ];
+      if (data.tp_order_id) lines.push(`TP: ${data.tp_order_id} @ ₹${data.tp_price}`);
+      if (data.sl_order_id) lines.push(`SL: ${data.sl_order_id} trig ₹${data.sl_trigger} / lim ₹${data.sl_price}`);
+      if (data.tp_error)   lines.push(`TP error: ${data.tp_error}`);
+      if (data.sl_error)   lines.push(`SL error: ${data.sl_error}`);
+      alert(lines.join('\n'));
+    } else {
+      alert(`Error: ${data.error || JSON.stringify(data)}`);
+    }
   } catch (e) {
     alert('Error: ' + e);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Execute (with TP/SL)';
   }
 }
-
-async function loadScan() {
-  const meta = document.getElementById('meta');
-  const diag = document.getElementById('diag');
-  const errors = document.getElementById('errors');
-
-  const buckets = {
-    'LONG_CE': document.getElementById('long-ce'),
-    'SHORT_CE': document.getElementById('short-ce'),
-    'LONG_PE': document.getElementById('long-pe'),
-    'SHORT_PE': document.getElementById('short-pe'),
-  };
-  for (const k in buckets) buckets[k].innerHTML = '<li>Loading…</li>';
-
-  try {
-    const res = await fetch('/api/smc-status', { cache: 'no-store' });
-    const data = await res.json();
-
-    meta.textContent = `Status: ${data.status || 'ok'} | Time: ${data.ts || ''} | Budget: ₹${data.budget ?? ''}`;
-    diag.textContent = JSON.stringify(data.diag || {}, null, 2);
-    errors.textContent = (data.errors && data.errors.length) ? data.errors.join(' | ') : '';
-
-    for (const k in buckets) buckets[k].innerHTML = '';
-
-    const picks = Array.isArray(data.picks) ? data.picks : [];
-    const longCE = picks.filter(p => p.type === 'CE' && p.trade_type === 'LONG').slice(0, 12);
-    const shortCE = picks.filter(p => p.type === 'CE' && p.trade_type === 'SHORT').slice(0, 12);
-    const longPE = picks.filter(p => p.type === 'PE' && p.trade_type === 'LONG').slice(0, 12);
-    const shortPE = picks.filter(p => p.type === 'PE' && p.trade_type === 'SHORT').slice(0, 12);
-
-    const fill = (arr, node) => {
-      if (!arr.length) { node.innerHTML = '<li>No ideas</li>'; return; }
-      node.innerHTML = arr.map(p => `<li>${rowHTML(p)}</li>`).join('');
-    };
-    fill(longCE, buckets.LONG_CE);
-    fill(shortCE, buckets.SHORT_CE);
-    fill(longPE, buckets.LONG_PE);
-    fill(shortPE, buckets.SHORT_PE);
-
-  } catch (e) {
-    for (const k in buckets) buckets[k].innerHTML = `<li>Error: ${e}</li>`;
-  }
-}
-
-window.addEventListener('load', loadScan);
