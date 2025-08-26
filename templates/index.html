@@ -1,13 +1,40 @@
-
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8" />
   <title>SMC Dashboard</title>
-  <script src="/static/script.js"></script>
+  <script defer src="/static/script.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    h1 { margin-bottom: 8px; }
+    .row { display: flex; gap: 24px; align-items: flex-start; }
+    .card { flex: 1; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; }
+    .card h2 { margin: 0 0 8px 0; font-size: 18px; }
+    ul { padding-left: 18px; }
+    li { margin: 6px 0; }
+    .muted { color: #6b7280; }
+    .err { color: #b91c1c; }
+  </style>
 </head>
 <body>
   <h1>Smart Money Concept Dashboard</h1>
-  <div id="buy-blocks"><h2>🟩 Buy Blocks</h2><ul id="buy-list"></ul></div>
-  <div id="sell-blocks"><h2>🟥 Sell Blocks</h2><ul id="sell-list"></ul></div>
+  <div class="muted" id="meta">Loading…</div>
+
+  <div class="row" style="margin-top:16px;">
+    <div class="card">
+      <h2>🟩 Buy (CE)</h2>
+      <ul id="buy-list"></ul>
+    </div>
+    <div class="card">
+      <h2>🟥 Sell (PE)</h2>
+      <ul id="sell-list"></ul>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h2>Diagnostics</h2>
+    <pre id="diag" class="muted" style="white-space:pre-wrap;"></pre>
+    <div id="errors" class="err"></div>
+  </div>
 </body>
 </html>
