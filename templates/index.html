@@ -7,27 +7,39 @@
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
     h1 { margin-bottom: 8px; }
-    .row { display: flex; gap: 24px; align-items: flex-start; }
-    .card { flex: 1; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; }
-    .card h2 { margin: 0 0 8px 0; font-size: 18px; }
-    ul { padding-left: 18px; }
-    li { margin: 6px 0; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; }
+    .card h2 { margin: 0 0 8px 0; font-size: 16px; }
+    ul { padding-left: 18px; margin: 0; }
+    li { margin: 8px 0; }
     .muted { color: #6b7280; }
     .err { color: #b91c1c; }
+    .btn { padding: 4px 8px; border: 1px solid #111827; border-radius: 6px; background: #fff; cursor: pointer; }
+    input[type="number"] { width: 80px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .pill { font-size: 12px; padding: 1px 6px; border-radius: 999px; background: #eef2ff; margin-left: 6px; }
   </style>
 </head>
 <body>
-  <h1>Smart Money Concept Dashboard</h1>
+  <h1>SMC Scanner — NIFTY-50 Options</h1>
   <div class="muted" id="meta">Loading…</div>
 
-  <div class="row" style="margin-top:16px;">
+  <div class="grid" style="margin-top:16px;">
     <div class="card">
-      <h2>🟩 Buy (CE)</h2>
-      <ul id="buy-list"></ul>
+      <h2>📈 Long Calls (CE)</h2>
+      <ul id="long-ce"></ul>
     </div>
     <div class="card">
-      <h2>🟥 Sell (PE)</h2>
-      <ul id="sell-list"></ul>
+      <h2>📉 Short Calls (CE)</h2>
+      <ul id="short-ce"></ul>
+    </div>
+    <div class="card">
+      <h2>📈 Long Puts (PE)</h2>
+      <ul id="long-pe"></ul>
+    </div>
+    <div class="card">
+      <h2>📉 Short Puts (PE)</h2>
+      <ul id="short-pe"></ul>
     </div>
   </div>
 
