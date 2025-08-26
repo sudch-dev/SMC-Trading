@@ -1,3 +1,4 @@
+# smc_logic.py
 import os
 from datetime import datetime, date, timedelta
 from math import log1p
@@ -17,22 +18,37 @@ def _load_nfo_once(kite):
         _INSTR_CACHE["loaded"] = True
     return _INSTR_CACHE["nfo"]
 
-# ---------- tiny TA on underlying ----------
+# ---------- helpers ----------
+def _to_date(obj):
+    """Normalize datetime/date to `date`; return None if missing."""
+    if not obj:
+        return None
+    # If it's a datetime-like with .date(), convert; if already a date, return as-is.
+    try:
+        return obj.date()  # works for datetime
+    except Exception:
+        return obj         # assume it's already a `date`
+
 def _ema(vals, p):
-    if not vals: return None
-    k = 2/(p+1); e = float(vals[0])
-    for v in vals: e = float(v)*k + e*(1-k)
+    if not vals:
+        return None
+    k = 2 / (p + 1)
+    e = float(vals[0])
+    for v in vals:
+        e = float(v) * k + e * (1 - k)
     return e
 
 def _rsi(closes, p=14):
-    if len(closes) < p+1: return None
+    if len(closes) < p + 1:
+        return None
     gains = losses = 0.0
-    for i in range(1, p+1):
+    for i in range(1, p + 1):
         d = closes[i] - closes[i - 1]
         gains += d if d > 0 else 0
         losses += -d if d < 0 else 0
-    if losses == 0: return 100.0
-    rs = (gains/p) / (losses/p)
+    if losses == 0:
+        return 100.0
+    rs = (gains / p) / (losses / p)
     return 100 - (100 / (1 + rs))
 
 def _pivots(h, l, c):
@@ -43,7 +59,7 @@ def _pivots(h, l, c):
 
 def _nearest_expiry(rows):
     today = date.today()
-    exps = sorted({r["expiry"].date() for r in rows if r.get("expiry")})
+    exps = sorted({_to_date(r["expiry"]) for r in rows if r.get("expiry")})
     for d in exps:
         if d >= today:
             return d
@@ -105,7 +121,7 @@ def run_smc_scan(kite):
             out["status"] = "error"
             out["errors"].append("No upcoming expiry")
             return out
-        base = [r for r in base if r.get("expiry") and r["expiry"].date() == exp]
+        base = [r for r in base if r.get("expiry") and _to_date(r["expiry"]) == exp]
 
         # 3) underlying direction (daily 40 days)
         idx_tokens = {"NIFTY": 256265, "BANKNIFTY": 260105}
@@ -204,9 +220,9 @@ def run_smc_scan(kite):
                 "name": meta.get("name"),
                 "type": side,                       # CE / PE
                 "side": side,
-                "status": "Buy" if side == "CE" else "Sell",  # so UI can split into lists
+                "status": "Buy" if side == "CE" else "Sell",  # for UI lists
                 "strike": float(meta.get("strike")) if meta.get("strike") is not None else None,
-                "expiry": str(meta.get("expiry").date()) if meta.get("expiry") else None,
+                "expiry": str(_to_date(meta.get("expiry"))) if meta.get("expiry") else None,
                 "ltp": float(ltp),
                 "lot_size": int(lot),
                 "score": round(sc, 6),
