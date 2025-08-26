@@ -1,59 +1,60 @@
-async function execOrder(btn) {
-  const input = btn.previousElementSibling;
-  const lots = parseInt(input.value || '0', 10);
-  const lotSize = parseInt(input.getAttribute('data-lot') || '1', 10);
-  const qty = lots * lotSize;
+async function loadScan() {
+  const meta = document.getElementById('meta');
+  const diag = document.getElementById('diag');
+  const errors = document.getElementById('errors');
 
-  if (qty <= 0) {
-    alert('Enter lots > 0');
-    return;
-  }
-
-  const symbol = input.getAttribute('data-sym');
-  const action = input.getAttribute('data-action'); // BUY/SELL
-  const tp = parseFloat(input.getAttribute('data-tp') || 'NaN');
-  const sl = parseFloat(input.getAttribute('data-sl') || 'NaN');
-
-  if (!confirm(`Place ${action} ${qty} of ${symbol}?\nTP: ${isNaN(tp)?'—':tp}\nSL: ${isNaN(sl)?'—':sl}\n(Entry will be LIMIT; server picks price)`)) return;
-
-  // optional UX: prevent double-clicks
-  btn.disabled = true; btn.textContent = 'Placing…';
+  const buckets = {
+    'LONG_CE': document.getElementById('long-ce'),
+    'SHORT_CE': document.getElementById('short-ce'),
+    'LONG_PE': document.getElementById('long-pe'),
+    'SHORT_PE': document.getElementById('short-pe'),
+  };
+  for (const k in buckets) buckets[k].innerHTML = '<li>Loading…</li>';
 
   try {
-    const res = await fetch('/api/execute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        symbol,
-        action,
-        quantity: qty,
-        order_type: 'LIMIT',      // ← IMPORTANT: always LIMIT now
-        // price: omit → backend computes from best bid/ask or ltp fallback
-        with_tp_sl: true,
-        tp: isNaN(tp) ? null : tp,
-        sl: isNaN(sl) ? null : sl,
-        product: 'NRML'
-      })
+    const res = await fetch('/api/smc-status', {
+      // some Safari builds get grumpy with 'no-store'
+      cache: 'reload'      // or just remove the cache option
     });
-    const data = await res.json();
 
-    if (data.status === 'ok') {
-      const lines = [
-        `Entry OK`,
-        `Order: ${data.entry_order_id}`,
-        `Used LIMIT: ₹${data.used_limit_price ?? '—'}`
-      ];
-      if (data.tp_order_id) lines.push(`TP: ${data.tp_order_id} @ ₹${data.tp_price}`);
-      if (data.sl_order_id) lines.push(`SL: ${data.sl_order_id} trig ₹${data.sl_trigger} / lim ₹${data.sl_price}`);
-      if (data.tp_error)   lines.push(`TP error: ${data.tp_error}`);
-      if (data.sl_error)   lines.push(`SL error: ${data.sl_error}`);
-      alert(lines.join('\n'));
+    // Robust parse: prefer JSON; otherwise read text and throw a readable error
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    let data;
+    if (ct.includes('application/json')) {
+      data = await res.json();
     } else {
-      alert(`Error: ${data.error || JSON.stringify(data)}`);
+      const text = await res.text();
+      throw new Error(`Non-JSON response (${res.status}) ${text.slice(0, 200)}`);
     }
+
+    meta.textContent = `Status: ${data.status || 'ok'} | Time: ${data.ts || ''} | Budget: ₹${data.budget ?? ''}`;
+    diag.textContent = JSON.stringify(data.diag || {}, null, 2);
+    errors.textContent = (data.errors && data.errors.length) ? data.errors.join(' | ') : '';
+
+    for (const k in buckets) buckets[k].innerHTML = '';
+
+    const picks = Array.isArray(data.picks) ? data.picks : [];
+    const longCE = picks.filter(p => p.type === 'CE' && p.trade_type === 'LONG').slice(0, 12);
+    const shortCE = picks.filter(p => p.type === 'CE' && p.trade_type === 'SHORT').slice(0, 12);
+    const longPE = picks.filter(p => p.type === 'PE' && p.trade_type === 'LONG').slice(0, 12);
+    const shortPE = picks.filter(p => p.type === 'PE' && p.trade_type === 'SHORT').slice(0, 12);
+
+    const fill = (arr, node) => {
+      if (!arr.length) { node.innerHTML = '<li>No ideas</li>'; return; }
+      node.innerHTML = arr.map(p => `<li>${rowHTML(p)}</li>`).join('');
+    };
+    fill(longCE, buckets.LONG_CE);
+    fill(shortCE, buckets.SHORT_CE);
+    fill(longPE, buckets.LONG_PE);
+    fill(shortPE, buckets.SHORT_PE);
+
   } catch (e) {
-    alert('Error: ' + e);
-  } finally {
-    btn.disabled = false; btn.textContent = 'Execute (with TP/SL)';
+    // Show the *actual* reason instead of Safari's vague SyntaxError
+    for (const k in buckets) {
+      buckets[k].innerHTML = `<li>Error: ${String(e).replace(/</g,'&lt;')}</li>`;
+    }
+    errors.textContent = String(e);
   }
 }
+
+window.addEventListener('load', loadScan);
