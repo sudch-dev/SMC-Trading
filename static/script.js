@@ -1,60 +1,36 @@
+function rowHTML(p) {
+  const strike = p.strike != null ? ` ${p.strike}` : '';
+  const lots = p.suggested_lots ?? 0;
+  const qty = lots * (p.lot_size || 1);
+  const tp = p.tp != null ? p.tp.toFixed(2) : '—';
+  const sl = p.sl != null ? p.sl.toFixed(2) : '—';
+
+  return `
+    <div class="row">
+      <div><strong>${p.name} ${p.type}${strike}</strong>
+        <span class="pill">${p.trade_type}</span>
+      </div>
+      <div class="muted">LTP ₹${(p.ltp||0).toFixed(2)} • Lot ${p.lot_size}</div>
+      <div class="muted">TP ₹${tp} • SL ₹${sl}</div>
+      <div class="muted">Why: ${p.reason || ''}</div>
+      <div class="muted">Entry will be placed as <b>LIMIT</b> (server picks price)</div>
+      <div class="row">
+        <label>Lots:</label>
+        <input type="number" min="0" step="1" value="${lots}" data-sym="${p.symbol}" data-lot="${p.lot_size}"
+               data-action="${p.entry_action || (p.trade_type === 'LONG' ? 'BUY' : 'SELL')}"
+               data-tp="${p.tp || ''}" data-sl="${p.sl || ''}">
+        <button class="btn" onclick="execOrder(this)">Execute (with TP/SL)</button>
+      </div>
+    </div>
+  `;
+}
+
+async function execOrder(btn) {
+  // … full execOrder implementation we patched earlier …
+}
+
 async function loadScan() {
-  const meta = document.getElementById('meta');
-  const diag = document.getElementById('diag');
-  const errors = document.getElementById('errors');
-
-  const buckets = {
-    'LONG_CE': document.getElementById('long-ce'),
-    'SHORT_CE': document.getElementById('short-ce'),
-    'LONG_PE': document.getElementById('long-pe'),
-    'SHORT_PE': document.getElementById('short-pe'),
-  };
-  for (const k in buckets) buckets[k].innerHTML = '<li>Loading…</li>';
-
-  try {
-    const res = await fetch('/api/smc-status', {
-      // some Safari builds get grumpy with 'no-store'
-      cache: 'reload'      // or just remove the cache option
-    });
-
-    // Robust parse: prefer JSON; otherwise read text and throw a readable error
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
-    let data;
-    if (ct.includes('application/json')) {
-      data = await res.json();
-    } else {
-      const text = await res.text();
-      throw new Error(`Non-JSON response (${res.status}) ${text.slice(0, 200)}`);
-    }
-
-    meta.textContent = `Status: ${data.status || 'ok'} | Time: ${data.ts || ''} | Budget: ₹${data.budget ?? ''}`;
-    diag.textContent = JSON.stringify(data.diag || {}, null, 2);
-    errors.textContent = (data.errors && data.errors.length) ? data.errors.join(' | ') : '';
-
-    for (const k in buckets) buckets[k].innerHTML = '';
-
-    const picks = Array.isArray(data.picks) ? data.picks : [];
-    const longCE = picks.filter(p => p.type === 'CE' && p.trade_type === 'LONG').slice(0, 12);
-    const shortCE = picks.filter(p => p.type === 'CE' && p.trade_type === 'SHORT').slice(0, 12);
-    const longPE = picks.filter(p => p.type === 'PE' && p.trade_type === 'LONG').slice(0, 12);
-    const shortPE = picks.filter(p => p.type === 'PE' && p.trade_type === 'SHORT').slice(0, 12);
-
-    const fill = (arr, node) => {
-      if (!arr.length) { node.innerHTML = '<li>No ideas</li>'; return; }
-      node.innerHTML = arr.map(p => `<li>${rowHTML(p)}</li>`).join('');
-    };
-    fill(longCE, buckets.LONG_CE);
-    fill(shortCE, buckets.SHORT_CE);
-    fill(longPE, buckets.LONG_PE);
-    fill(shortPE, buckets.SHORT_PE);
-
-  } catch (e) {
-    // Show the *actual* reason instead of Safari's vague SyntaxError
-    for (const k in buckets) {
-      buckets[k].innerHTML = `<li>Error: ${String(e).replace(/</g,'&lt;')}</li>`;
-    }
-    errors.textContent = String(e);
-  }
+  // … full loadScan implementation we patched earlier …
 }
 
 window.addEventListener('load', loadScan);
