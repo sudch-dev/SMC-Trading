@@ -2,7 +2,7 @@ import os
 from flask import Flask, redirect, request, render_template, jsonify
 from kiteconnect import KiteConnect
 from dotenv import load_dotenv
-from smc_logic import run_smc_scan  # your scanner
+from smc_logic import run_smc_scan  # scanner
 
 # extras for recording + rounding
 import json
@@ -17,10 +17,10 @@ app = Flask(__name__)
 API_KEY = os.getenv("API_KEY", "")
 API_SECRET = os.getenv("API_SECRET", "")
 
-# allow or block live order execution (safety switch)
+# safety switch for live orders
 ALLOW_ORDER_EXEC = os.getenv("ALLOW_ORDER_EXEC", "0") in ("1", "true", "True")
 
-# default product for entries/exits (NRML recommended for AMO)
+# NRML recommended for AMO in NFO
 PRODUCT_DEFAULT = os.getenv("PRODUCT", "NRML")  # NRML or MIS
 
 # option tick size (₹) for rounding prices
@@ -128,42 +128,45 @@ def api_health():
 
 @app.route("/api/smc-status")
 def api_smc_status():
-    """Return latest scan with TP/SL suggestions."""
+    """
+    Always return JSON (even on errors) so the frontend never sees HTML 500.
+    """
     global smc_status
-    if access_token:
-        kite.set_access_token(access_token)
-        try:
-            smc_status = run_smc_scan(kite) or {}
-        except Exception as e:
-            smc_status = {"status": "error", "error": str(e)}
-    else:
-        smc_status = {
+    if not access_token:
+        return jsonify({
             "status": "error",
             "error": "Not logged in. Please complete Kite login.",
-        }
-    return jsonify(smc_status)
+            "picks": [],
+            "diag": {},
+            "errors": ["no_access_token"]
+        }), 401
+
+    try:
+        kite.set_access_token(access_token)
+        smc_status = run_smc_scan(kite) or {}
+        return jsonify(smc_status)
+    except Exception as e:
+        err = str(e)
+        return jsonify({
+            "status": "error",
+            "error": err,
+            "picks": [],
+            "diag": {},
+            "errors": [err]
+        }), 500
 
 
 @app.route("/api/execute", methods=["POST"])
 def api_execute():
     """
-    Entry is always placed as LIMIT (no MARKET).
+    Entry is always placed as LIMIT.
     TP = LIMIT. SL = stop-loss LIMIT (SL).
-    Action is derived from trade_type if provided (LONG->BUY, SHORT->SELL).
-
-    If market is closed (or broker refuses regular placement) and ALLOW_AMO=1,
-    we fallback to VARIETY_AMO for the ENTRY ONLY and skip TP/SL legs.
+    If market is closed & ALLOW_AMO=1 -> fallback to VARIETY_AMO for ENTRY ONLY,
+    and skip TP/SL legs.
     """
     if not ALLOW_ORDER_EXEC:
-        return (
-            jsonify(
-                {
-                    "status": "error",
-                    "error": "Order execution disabled. Set ALLOW_ORDER_EXEC=1",
-                }
-            ),
-            403,
-        )
+        return jsonify({"status": "error",
+                        "error": "Order execution disabled. Set ALLOW_ORDER_EXEC=1"}), 403
     if not access_token:
         return jsonify({"status": "error", "error": "Not logged in."}), 401
 
@@ -173,9 +176,7 @@ def api_execute():
     try:
         symbol_full = payload.get("symbol", "")
         tradingsymbol = (
-            symbol_full.split(":", 1)[1]
-            if symbol_full.startswith("NFO:")
-            else symbol_full
+            symbol_full.split(":", 1)[1] if symbol_full.startswith("NFO:") else symbol_full
         )
 
         qty = int(payload.get("quantity", 0))
@@ -183,35 +184,28 @@ def api_execute():
         trade_type = (payload.get("trade_type") or "").upper()  # LONG / SHORT
         opt_side = (payload.get("type") or "").upper()  # CE / PE (for logging)
 
-        # derive action from intent to avoid CE/PE drift
+        # derive action from trade_type to avoid drift
         if trade_type in ("LONG", "SHORT"):
             action = "BUY" if trade_type == "LONG" else "SELL"
 
         order_type_req = (payload.get("order_type", "LIMIT")).upper()
         product = payload.get("product", PRODUCT_DEFAULT)
-        price_req = payload.get("price")  # only used if client sends explicit limit
+        price_req = payload.get("price")
 
         if action not in ("BUY", "SELL"):
             return jsonify({"status": "error", "error": "Invalid action"}), 400
         if qty <= 0:
             return jsonify({"status": "error", "error": "Quantity must be > 0"}), 400
 
-        # Force LIMIT entry — either client price or derived from quote
+        # Force LIMIT entry — client price or derived from quote
         if order_type_req == "LIMIT" and price_req is not None:
             chosen_price = _tick_round(price_req, OPT_TICK)
             quote_snap = {"from": "client_price"}
         else:
             chosen_price, quote_snap = _compute_limit_from_quote(tradingsymbol, action)
         if chosen_price is None:
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "error": "Unable to derive limit price from quote",
-                    }
-                ),
-                502,
-            )
+            return jsonify({"status": "error",
+                            "error": "Unable to derive limit price from quote"}), 502
 
         # ---------- ENTRY: try REGULAR first, then AMO fallback ----------
         entry_kwargs = dict(
@@ -221,7 +215,7 @@ def api_execute():
             transaction_type=action,
             quantity=qty,
             product=product,
-            order_type=KiteConnect.ORDER_TYPE_LIMIT,  # always LIMIT
+            order_type=KiteConnect.ORDER_TYPE_LIMIT,
             validity=KiteConnect.VALIDITY_DAY,
             price=float(chosen_price),
         )
@@ -234,41 +228,23 @@ def api_execute():
             entry_id = kite.place_order(**entry_kwargs)
         except Exception as ex:
             msg = str(ex).lower()
-            # market-closed / AMO-eligible style failures → fallback if allowed
             if ALLOW_AMO and any(pat in msg for pat in AMO_FALLBACK_PATTERNS):
                 try:
                     amo_kwargs = dict(entry_kwargs)
                     amo_kwargs["variety"] = KiteConnect.VARIETY_AMO
                     entry_id = kite.place_order(**amo_kwargs)
                     queued_as_amo = True
-                    amo_note = (
-                        "Entry queued as AMO (market closed). TP/SL legs were skipped."
-                    )
+                    amo_note = "Entry queued as AMO (market closed). TP/SL legs were skipped."
                 except Exception as ex2:
-                    # Could not even place AMO — return that message
-                    return (
-                        jsonify(
-                            {"status": "error", "error": f"AMO failed: {str(ex2)}"}
-                        ),
-                        400,
-                    )
+                    return jsonify({"status": "error", "error": f"AMO failed: {str(ex2)}"}), 400
             else:
-                # Different error (margin/product/rejections etc.)
                 return jsonify({"status": "error", "error": str(ex)}), 400
 
         # audit trail
         _record_entry(
-            tradingsymbol,
-            action,
-            qty,
-            chosen_price,
-            quote_snap,
-            extra={
-                "entry_order_id": entry_id,
-                "trade_type": trade_type,
-                "type": opt_side,
-                "queued_as_amo": queued_as_amo,
-            },
+            tradingsymbol, action, qty, chosen_price, quote_snap,
+            extra={"entry_order_id": entry_id, "trade_type": trade_type,
+                   "type": opt_side, "queued_as_amo": queued_as_amo}
         )
 
         resp = {
@@ -282,12 +258,11 @@ def api_execute():
             resp["note"] = amo_note
 
         # ---------- Optional exits ----------
-        # Skip when AMO: exchanges won't accept linked exits now.
+        # Skip exits when AMO; add later after market opens if needed
         if payload.get("with_tp_sl") and not queued_as_amo:
             tp = payload.get("tp")
             sl = payload.get("sl")
 
-            # TP → LIMIT
             if tp is not None:
                 tp_price = _tick_round(tp, OPT_TICK)
                 exit_tp_kwargs = dict(
@@ -307,7 +282,6 @@ def api_execute():
                 except Exception as e:
                     resp["tp_error"] = str(e)
 
-            # SL → stop-loss LIMIT (SL) with one-tick offset
             if sl is not None:
                 sl_trig = _tick_round(sl, OPT_TICK)
                 sl_price = _tick_round(
@@ -321,7 +295,7 @@ def api_execute():
                     transaction_type=("SELL" if action == "BUY" else "BUY"),
                     quantity=qty,
                     product=product,
-                    order_type=KiteConnect.ORDER_TYPE_SL,  # stop-loss LIMIT
+                    order_type=KiteConnect.ORDER_TYPE_SL,
                     price=float(sl_price),
                     trigger_price=float(sl_trig),
                     validity=KiteConnect.VALIDITY_DAY,
@@ -333,7 +307,6 @@ def api_execute():
                 except Exception as e:
                     resp["sl_error"] = str(e)
 
-        # If AMO, explicitly mention exits were skipped
         if queued_as_amo:
             resp["tp_error"] = resp.get("tp_error") or "Skipped because entry is AMO"
             resp["sl_error"] = resp.get("sl_error") or "Skipped because entry is AMO"
@@ -345,5 +318,6 @@ def api_execute():
 
 
 if __name__ == "__main__":
+    # Keep memory low; single worker recommended on Render free
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
