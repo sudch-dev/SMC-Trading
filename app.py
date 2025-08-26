@@ -2,11 +2,12 @@ import os
 from flask import Flask, redirect, request, render_template, jsonify
 from kiteconnect import KiteConnect
 from dotenv import load_dotenv
-from smc_logic import run_smc_scan  # uses the separate module
+from smc_logic import run_smc_scan  # your scanner
 
-# --- NEW: for recording and rounding ---
+# extras for recording + rounding
 import json
 from pathlib import Path
+from datetime import datetime
 
 load_dotenv()
 
@@ -16,7 +17,7 @@ API_KEY = os.getenv("API_KEY", "")
 API_SECRET = os.getenv("API_SECRET", "")
 ALLOW_ORDER_EXEC = os.getenv("ALLOW_ORDER_EXEC", "0") in ("1", "true", "True")
 PRODUCT_DEFAULT = os.getenv("PRODUCT", "NRML")  # NRML or MIS
-OPT_TICK = float(os.getenv("OPT_TICK", "0.05"))  # common option tick
+OPT_TICK = float(os.getenv("OPT_TICK", "0.05"))  # typical NFO option tick
 
 kite = KiteConnect(api_key=API_KEY)
 
@@ -28,7 +29,7 @@ def _tick_round(x, tick=0.05):
     return round(round(float(x)/tick)*tick, 2)
 
 def _compute_limit_from_quote(tradingsymbol, action):
-    """Pick a reasonable LIMIT based on best bid/ask (fallback LTP)."""
+    """Choose a LIMIT price from best bid/ask (LTP fallback), tick-rounded."""
     q = {}
     try:
         q = kite.quote([f"NFO:{tradingsymbol}"]) or {}
@@ -44,13 +45,13 @@ def _compute_limit_from_quote(tradingsymbol, action):
     if ref is None:
         return None, {"ltp": None, "best_buy": None, "best_sell": None}
 
-    price = _tick_round(ref, OPT_TICK)  # stay within tick & band
+    price = _tick_round(ref, OPT_TICK)
     snap = {"ltp": ltp, "best_buy": best_buy, "best_sell": best_sell}
     return price, snap
 
 def _record_entry(symbol, action, qty, chosen_price, quote_snapshot, extra=None):
     rec = {
-        "ts": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "symbol": symbol,
         "action": action,
         "qty": qty,
@@ -92,6 +93,10 @@ def callback():
 def dashboard():
     return render_template('index.html')
 
+@app.route('/api/health')
+def api_health():
+    return {"ok": True, "logged_in": bool(access_token)}
+
 @app.route('/api/smc-status')
 def api_smc_status():
     """Return latest scan with TP/SL suggestions."""
@@ -109,8 +114,9 @@ def api_smc_status():
 @app.route('/api/execute', methods=['POST'])
 def api_execute():
     """
-    Entry is always placed as LIMIT (no MARKET). TP = LIMIT. SL = stop-loss LIMIT (SL).
-    Also records observed quote/price to entry_records.json.
+    Entry is always placed as LIMIT (no MARKET).
+    TP = LIMIT. SL = stop-loss LIMIT (SL).
+    Action is derived from trade_type if provided (LONG->BUY, SHORT->SELL).
     """
     if not ALLOW_ORDER_EXEC:
         return jsonify({"status": "error", "error": "Order execution disabled. Set ALLOW_ORDER_EXEC=1"}), 403
@@ -125,8 +131,15 @@ def api_execute():
         tradingsymbol = symbol_full.split(":", 1)[1] if symbol_full.startswith("NFO:") else symbol_full
 
         qty = int(payload.get("quantity", 0))
-        action = (payload.get("action", "")).upper()
-        order_type_req = (payload.get("order_type", "MARKET")).upper()
+        action = (payload.get("action", "")).upper()  # legacy fallback
+        trade_type = (payload.get("trade_type") or "").upper()  # LONG / SHORT
+        opt_side = (payload.get("type") or "").upper()  # CE / PE (for logging)
+
+        # 🔒 derive action from intent to avoid CE/PE drift
+        if trade_type in ("LONG", "SHORT"):
+            action = "BUY" if trade_type == "LONG" else "SELL"
+
+        order_type_req = (payload.get("order_type", "LIMIT")).upper()
         product = payload.get("product", PRODUCT_DEFAULT)
         price_req = payload.get("price")  # only used if LIMIT explicitly supplied
 
@@ -135,7 +148,7 @@ def api_execute():
         if qty <= 0:
             return jsonify({"status": "error", "error": "Quantity must be > 0"}), 400
 
-        # Force LIMIT entry — either user-specified limit or derived from quote
+        # Force LIMIT entry — either client limit or derived from quote
         if order_type_req == "LIMIT" and price_req is not None:
             chosen_price = _tick_round(price_req, OPT_TICK)
             quote_snap = {"from": "client_price"}
@@ -158,12 +171,15 @@ def api_execute():
         entry_id = kite.place_order(**entry_kwargs)
 
         # audit trail
-        _record_entry(tradingsymbol, action, qty, chosen_price, quote_snap, extra={"entry_order_id": entry_id})
+        _record_entry(
+            tradingsymbol, action, qty, chosen_price, quote_snap,
+            extra={"entry_order_id": entry_id, "trade_type": trade_type, "type": opt_side}
+        )
 
         resp = {"status": "ok", "entry_order_id": entry_id, "tp_order_id": None, "sl_order_id": None,
                 "used_limit_price": chosen_price}
 
-        # Optional exits (both LIMIT-type)
+        # Optional exits
         if payload.get("with_tp_sl"):
             tp = payload.get("tp")
             sl = payload.get("sl")
@@ -188,11 +204,10 @@ def api_execute():
                 except Exception as e:
                     resp["tp_error"] = str(e)
 
-            # SL → stop-loss LIMIT (SL) with 1 tick offset from trigger
+            # SL → stop-loss LIMIT (SL) with one-tick offset
             if sl is not None:
                 sl_trig = _tick_round(sl, OPT_TICK)
                 sl_price = _tick_round((sl_trig - OPT_TICK) if action == "BUY" else (sl_trig + OPT_TICK), OPT_TICK)
-
                 exit_sl_kwargs = dict(
                     variety=KiteConnect.VARIETY_REGULAR,
                     exchange=KiteConnect.EXCHANGE_NFO,
