@@ -20,24 +20,17 @@ RISK_FREE = float(os.getenv("RISK_FREE", "0.07"))        # ~7% India
 DIV_YIELD = float(os.getenv("DIV_YIELD", "0.00"))        # dividend yield for stocks
 
 # --- Greeks gates (tunable) ---
-# IV ranges (annualized as decimals, e.g., 0.18 = 18%)
 IV_MIN_LONG   = float(os.getenv("IV_MIN_LONG",  "0.12"))
 IV_MAX_LONG   = float(os.getenv("IV_MAX_LONG",  "0.45"))
-IV_MIN_SHORT  = float(os.getenv("IV_MIN_SHORT", "0.28"))   # prefer short when IV is elevated
+IV_MIN_SHORT  = float(os.getenv("IV_MIN_SHORT", "0.28"))
 
-# Delta bands (abs value for puts)
 DELTA_MIN_CALL = float(os.getenv("DELTA_MIN_CALL", "0.30"))
 DELTA_MAX_CALL = float(os.getenv("DELTA_MAX_CALL", "0.65"))
 DELTA_MIN_PUT  = float(os.getenv("DELTA_MIN_PUT",  "0.30"))
 DELTA_MAX_PUT  = float(os.getenv("DELTA_MAX_PUT",  "0.65"))
 
-# Gamma cap (avoid ultra-near-expiry convexity blow-ups)
 GAMMA_MAX = float(os.getenv("GAMMA_MAX", "0.02"))
-
-# Theta daily bleed cap as fraction of premium (e.g., 0.02 => ≤2% of premium/day)
 THETA_MAX_PCT = float(os.getenv("THETA_MAX_PCT", "0.02"))
-
-# If Greeks missing, should we keep the pick? (0/1)
 ALLOW_IF_NO_GREEKS = os.getenv("ALLOW_IF_NO_GREEKS", "0") in ("1", "true", "True")
 
 DEBUG_SCAN = os.getenv("DEBUG_SCAN", "0") in ("1", "true", "True")
@@ -160,12 +153,14 @@ def _pivots(h,l,c):
     r1=2*pp-l; s1=2*pp-h
     return pp,r1,s1
 
-def _nearest_expiry(rows):
-    today=date.today()
-    exps=sorted({_to_date(r["expiry"]) for r in rows if r.get("expiry")})
-    for d in exps:
-        if d>=today: return d
-    return exps[-1] if exps else None
+def _next_expiries(rows, n=2):
+    """Return the next n expiries (including today if equal); fallback to last n if none future."""
+    today = date.today()
+    exps = sorted({_to_date(r["expiry"]) for r in rows if r.get("expiry")})
+    fut = [d for d in exps if d and d >= today]
+    if not fut:
+        return exps[-n:] if len(exps) >= n else exps
+    return fut[:n]
 
 def _ring(strikes, atm, steps):
     try: i=strikes.index(atm)
@@ -275,10 +270,6 @@ def implied_vol(side, S, K, T, price, r=RISK_FREE, q=DIV_YIELD, lo=1e-4, hi=5.0,
 
 # ======================= GREEK-AWARE SMC =======================
 def _apply_greeks_gates(side, base_trade_type, ltp, iv, greeks):
-    """
-    Enforce Greeks constraints on the base TA decision.
-    Returns (final_trade_type, reason_suffix, passed)
-    """
     if iv is None or greeks.get("delta") is None:
         if ALLOW_IF_NO_GREEKS:
             return base_trade_type, "Greeks missing (allowed)", True
@@ -286,9 +277,8 @@ def _apply_greeks_gates(side, base_trade_type, ltp, iv, greeks):
 
     delta = greeks.get("delta") or 0.0
     gamma = greeks.get("gamma") or 0.0
-    theta = greeks.get("theta") or 0.0  # per day; usually negative for longs
+    theta = greeks.get("theta") or 0.0  # per day
 
-    # theta bleed fraction of premium/day (positive magnitude)
     theta_bleed_pct = abs(theta) / max(ltp, 1e-9)
 
     ok = True
@@ -310,7 +300,7 @@ def _apply_greeks_gates(side, base_trade_type, ltp, iv, greeks):
             ok = False; fails.append(f"Γ {gamma:.4f} > {GAMMA_MAX}")
         # Theta bleed
         if theta_bleed_pct > THETA_MAX_PCT:
-            ok = False; fails.append(f"θ {theta_bleed_pct:.2%} > {THETA_MAX_PCT:.2%} per day")
+            ok = False; fails.append(f"θ {theta_bleed_pct:.2%} > {THETA_MAX_PCT:.2%}/day")
 
         if ok:
             return "LONG", "Greeks ok", True
@@ -318,16 +308,13 @@ def _apply_greeks_gates(side, base_trade_type, ltp, iv, greeks):
             return "SHORT", "Greeks fail: " + "; ".join(fails), False
 
     else:  # base SHORT
-        # For shorts, prefer elevated IV; delta extremes are okay but avoid ultra-gamma
         if iv < IV_MIN_SHORT:
             ok = False; fails.append(f"IV {iv:.2f} < {IV_MIN_SHORT:.2f}")
         if gamma > GAMMA_MAX:
             ok = False; fails.append(f"Γ {gamma:.4f} > {GAMMA_MAX}")
-
         if ok:
             return "SHORT", "Greeks favor short", True
         else:
-            # If short gates fail, we won’t flip to long; keep SHORT but mark weak
             return "SHORT", "Weak short (Greeks fail: " + "; ".join(fails) + ")", False
 
 
@@ -342,12 +329,12 @@ def run_smc_scan(kite):
         if not nfo:
             out["status"]="error"; out["errors"].append("No NFO rows for NIFTY50"); return out
 
-        # nearest expiry
-        exp = _nearest_expiry(nfo)
-        out["diag"]["expiry"]=str(exp) if exp else None
-        if not exp:
-            out["status"]="error"; out["errors"].append("No upcoming expiry"); return out
-        base = [r for r in nfo if r.get("expiry") and _to_date(r["expiry"])==exp]
+        # ---- use next two expiries ----
+        exps = _next_expiries(nfo, n=2)
+        out["diag"]["expiries"] = [str(e) for e in exps]
+        if not exps:
+            out["status"]="error"; out["errors"].append("No upcoming expiries"); return out
+        base = [r for r in nfo if r.get("expiry") and _to_date(r["expiry"]) in exps]
 
         # token map for underlying stocks (NSE)
         tokens = _map_tokens(nse, NIFTY50)
@@ -397,7 +384,6 @@ def run_smc_scan(kite):
             for r in rows:
                 if r.get("strike") not in ring: continue
                 side = r.get("instrument_type")
-                # Base TA bias
                 base_type, rationale = _trade_bias_from_ta(
                     side, ta[nm]["ema5"], ta[nm]["ema10"], ta[nm]["px"], ta[nm]["r1"], ta[nm]["s1"], ta[nm]["rsi"]
                 )
@@ -417,7 +403,7 @@ def run_smc_scan(kite):
             except Exception as e:
                 out["errors"].append(f"quote error: {str(e)}")
 
-        # Score and compute Greeks-aware decision
+        # Score + Greeks-aware decision
         scored = []
         for sym, meta, side, base_type, rationale, nm in candidates:
             q = quotes.get(sym) or {}
@@ -426,7 +412,7 @@ def run_smc_scan(kite):
             sc  = _score(q, lot, ltp, base_type)
 
             # ---- IV + Greeks inputs ----
-            S   = float(last_px.get(nm) or 0.0)  # underlying spot
+            S   = float(last_px.get(nm) or 0.0)
             K   = float(meta.get("strike") or 0.0)
             now  = datetime.now()
             expd = _to_date(meta.get("expiry"))
@@ -457,7 +443,7 @@ def run_smc_scan(kite):
                 "symbol": sym,
                 "tradingsymbol": meta.get("tradingsymbol"),
                 "name": nm,
-                "type": side,                          # CE/PE
+                "type": side,
                 "trade_type": final_type,              # LONG/SHORT after Greeks
                 "strike": float(meta.get("strike")) if meta.get("strike") is not None else None,
                 "expiry": str(_to_date(meta.get("expiry"))) if meta.get("expiry") else None,
@@ -470,8 +456,6 @@ def run_smc_scan(kite):
                 "sl": sl,
                 "entry_action": entry_action,
                 "exit_action": exit_action,
-
-                # Greeks fields
                 "iv": float(iv) if iv else None,
                 "delta": gks.get("delta"),
                 "gamma": gks.get("gamma"),
