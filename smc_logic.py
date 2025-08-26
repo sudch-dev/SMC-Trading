@@ -3,213 +3,147 @@ import os
 from datetime import datetime, date, timedelta
 from math import log1p
 
-# ---------- Config ----------
-BUDGET = float(os.getenv("BUDGET", "1000"))     # total ₹ budget
-RING_STRIKES = int(os.getenv("RING_STRIKES", "4"))  # strike steps on each side of ATM
-DEBUG_SCAN = os.getenv("DEBUG_SCAN", "0") in ("1", "true", "True")
+BUDGET = float(os.getenv("BUDGET", "1000"))
+RING_STRIKES = int(os.getenv("RING_STRIKES", "4"))
+UNDERLYINGS = ("NIFTY", "BANKNIFTY")
 
-# Underlyings we support (index names as they appear in instruments list)
-UNDERLYINGS = ["NIFTY", "BANKNIFTY"]
+# ------------ module-level cache ------------
+_INSTR_CACHE = {"loaded": False, "nfo": []}
 
-# ---------- Small TA on UNDERLYING (not option) ----------
-def _ema(series, period):
-    if not series: return None
-    k = 2 / (period + 1)
-    e = float(series[0])
-    for v in series:
-        e = float(v) * k + e * (1 - k)
+def _load_nfo_once(kite):
+    if not _INSTR_CACHE["loaded"]:
+        _INSTR_CACHE["nfo"] = kite.instruments("NFO") or []
+        _INSTR_CACHE["loaded"] = True
+    return _INSTR_CACHE["nfo"]
+
+# ------------ tiny TA on underlying ------------
+def _ema(vals, p):
+    if not vals: return None
+    k = 2/(p+1); e = float(vals[0])
+    for v in vals: e = float(v)*k + e*(1-k)
     return e
 
-def _rsi(closes, period=14):
-    if len(closes) < period + 1: return None
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        diff = closes[i] - closes[i - 1]
-        if diff >= 0: gains.append(diff)
-        else: losses.append(-diff)
-    ag = sum(gains) / period if gains else 0.0
-    al = sum(losses) / period if losses else 0.0
-    if al == 0: return 100.0
-    rs = ag / al
-    return 100 - (100 / (1 + rs))
+def _rsi(closes, p=14):
+    if len(closes) < p+1: return None
+    gains=losses=0.0
+    for i in range(1, p+1):
+        d=closes[i]-closes[i-1]
+        gains += d if d>0 else 0
+        losses+= -d if d<0 else 0
+    if losses==0: return 100.0
+    rs=gains/p/(losses/p)
+    return 100 - (100/(1+rs))
 
-def _pivots(prev_high, prev_low, prev_close):
-    pp = (prev_high + prev_low + prev_close) / 3.0
-    r1 = 2 * pp - prev_low
-    s1 = 2 * pp - prev_high
-    return pp, r1, s1
+def _pivots(h,l,c):
+    pp=(h+l+c)/3.0
+    r1=2*pp-l; s1=2*pp-h
+    return pp,r1,s1
 
-def _nearest_expiry_for(names, instruments):
-    today = date.today()
-    exps = sorted({
-        r["expiry"].date()
-        for r in instruments
-        if r.get("expiry") and r.get("name") in names and r.get("segment","").startswith("NFO-")
-    })
+def _nearest_expiry(rows):
+    today=date.today()
+    exps=sorted({r["expiry"].date() for r in rows if r.get("expiry")})
     for d in exps:
-        if d >= today:
-            return d
+        if d>=today: return d
     return exps[-1] if exps else None
 
-def _score_option(q, lot_size, ltp, best_bid, best_ask):
-    # simple: prefer liquidity & tight spread & cheaper contracts (to fit budget)
-    liq = log1p(q.get("volume") or 0)
-    spread = 0.08
-    if best_bid and best_ask and ltp:
-        spread = max(0.0, (best_ask - best_bid) / max(ltp, 1e-6))
-    affordability = 1.0 if (ltp * lot_size) <= (BUDGET/5.0) else 0.0
-    return 0.6*liq - 0.3*spread + 0.1*affordability
-
-def _build_ring_strikes(strikes_sorted, atm, steps):
-    # get indices for atm; if exact match missing, use nearest
+def _ring(strikes, atm, steps):
     try:
-        idx = strikes_sorted.index(atm)
+        i=strikes.index(atm)
     except ValueError:
-        idx = min(range(len(strikes_sorted)), key=lambda i: abs(strikes_sorted[i]-atm))
-    lo = max(0, idx - steps)
-    hi = min(len(strikes_sorted)-1, idx + steps)
-    return set(strikes_sorted[lo:hi+1])
+        i=min(range(len(strikes)), key=lambda k: abs(strikes[k]-atm))
+    lo=max(0, i-steps); hi=min(len(strikes)-1, i+steps)
+    return set(strikes[lo:hi+1])
 
-# ---------- Main ----------
+def _score(q, lot, ltp):
+    liq = log1p(q.get("volume") or 0)
+    d = q.get("depth") or {}
+    bb = (d.get("buy") or [{}])[0].get("price")
+    ba = (d.get("sell") or [{}])[0].get("price")
+    spr = (ba-bb)/ltp if (bb and ba and ltp) else 0.08
+    aff = 1.0 if (ltp*lot) <= (BUDGET/5.0) else 0.0
+    return 0.6*liq - 0.3*spr + 0.1*aff
+
 def run_smc_scan(kite):
-    """
-    Scan only NIFTY & BANKNIFTY CE/PE for nearest expiry.
-    Direction from underlying:
-      Bullish if EMA5>EMA10 AND price>R1 AND RSI(14)<70  -> prefer CE
-      Bearish if EMA5<EMA10 AND price<S1 AND RSI(14)>30  -> prefer PE
-      Else: consider both sides but rank by liquidity/spread.
-    Returns up to 5 picks total.
-    """
-    out = {"status": "ok", "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-           "budget": BUDGET, "picks": [], "errors": [], "diag": {}}
+    out = {"status":"ok","ts":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "budget":BUDGET,"picks":[],"errors":[],"diag":{}}
     try:
-        # 1) Load NFO instruments once and filter to our underlyings
-        nfo = kite.instruments("NFO")
+        # 1) instruments cache
+        nfo = _load_nfo_once(kite)
         base = [r for r in nfo if r.get("name") in UNDERLYINGS and r.get("instrument_type") in ("CE","PE")]
-        out["diag"]["nfo_count"] = len(nfo)
-        out["diag"]["filtered"] = len(base)
+        out["diag"]["nfo_total"]=len(nfo); out["diag"]["nfo_filtered"]=len(base)
         if not base:
-            out["status"] = "error"; out["errors"].append("No NFO instruments for NIFTY/BANKNIFTY"); return out
+            out["status"]="error"; out["errors"].append("No NFO rows for NIFTY/BANKNIFTY"); return out
 
-        exp = _nearest_expiry_for(UNDERLYINGS, base)
+        # 2) nearest expiry
+        exp = _nearest_expiry(base)
+        out["diag"]["expiry"]=str(exp) if exp else None
         if not exp:
-            out["status"] = "error"; out["errors"].append("No upcoming expiry found"); return out
-        out["diag"]["expiry"] = str(exp)
+            out["status"]="error"; out["errors"].append("No upcoming expiry"); return out
+        base = [r for r in base if r.get("expiry") and r["expiry"].date()==exp]
 
-        base = [r for r in base if r.get("expiry") and r["expiry"].date() == exp]
-
-        # 2) Decide direction from UNDERLYING OHLC (daily, 30 days)
-        # instrument_token for indices (Zerodha): NIFTY=256265, BANKNIFTY=260105 (commonly used; fallback via instruments if needed)
-        index_tokens = {"NIFTY": 256265, "BANKNIFTY": 260105}
-        bias_map = {}   # name -> "CE"/"PE"/"BOTH"
-        last_price_map = {}  # last close for ATM calc
-
+        # 3) underlying direction (daily)
+        idx_tokens = {"NIFTY": 256265, "BANKNIFTY": 260105}
+        bias = {}     # CE/PE/BOTH
+        last_px = {}
         for nm in UNDERLYINGS:
-            token = index_tokens.get(nm)
-            if not token:
-                # fallback via kite.instruments("NSE") search
-                try:
-                    for r in kite.instruments("NSE"):
-                        if r.get("name")==nm or r.get("tradingsymbol")==nm:
-                            token = r.get("instrument_token"); break
-                except Exception:
-                    pass
+            token = idx_tokens.get(nm)
             try:
-                to_d = datetime.now()
-                fr_d = to_d - timedelta(days=40)
-                hist = kite.historical_data(token, fr_d, to_d, "day")
+                to_d=datetime.now(); fr_d=to_d - timedelta(days=40)
+                hist=kite.historical_data(token, fr_d, to_d, "day")
             except Exception:
-                hist = []
-
-            if not hist or len(hist) < 15:
-                # if no data, allow both sides
-                bias_map[nm] = "BOTH"
-                last_price_map[nm] = None
-                continue
-
-            closes = [c["close"] for c in hist]
-            highs  = [c["high"] for c in hist]
-            lows   = [c["low"]  for c in hist]
-            ema5   = _ema(closes[-10:], 5)
-            ema10  = _ema(closes[-10:], 10)
-            rsi    = _rsi(closes[-15:], 14)
-            prev_h, prev_l, prev_c = highs[-2], lows[-2], closes[-2]
-            pp, r1, s1 = _pivots(prev_h, prev_l, prev_c)
-            px = closes[-1]
-
-            bullish = (ema5 and ema10 and ema5 > ema10) and (px > r1) and (rsi is not None and rsi < 70)
-            bearish = (ema5 and ema10 and ema5 < ema10) and (px < s1) and (rsi is not None and rsi > 30)
-
-            if bullish: bias_map[nm] = "CE"
-            elif bearish: bias_map[nm] = "PE"
-            else: bias_map[nm] = "BOTH"
-
-            last_price_map[nm] = px
-            if DEBUG_SCAN:
-                out["diag"][f"{nm}_ta"] = {"ema5": round(ema5,2) if ema5 else None,
-                                           "ema10": round(ema10,2) if ema10 else None,
-                                           "rsi": round(rsi,2) if rsi else None,
-                                           "pp": round(pp,2), "r1": round(r1,2), "s1": round(s1,2), "px": round(px,2)}
-
-        # 3) Build candidate option symbols near ATM for each underlying, respecting side bias
-        candidates = []
-        by_under = {nm: [r for r in base if r.get("name")==nm] for nm in UNDERLYINGS}
-
-        for nm, rows in by_under.items():
-            if not rows: continue
-            strikes = sorted({r.get("strike") for r in rows if r.get("strike") is not None})
-            if not strikes: continue
-
-            px = last_price_map.get(nm)
-            if not px:
-                # fallback: use median strike as ATM proxy
-                atm = strikes[len(strikes)//2]
+                hist=[]
+            if not hist or len(hist)<15:
+                bias[nm]="BOTH"; last_px[nm]=None; continue
+            closes=[c["close"] for c in hist]
+            highs=[c["high"] for c in hist]; lows=[c["low"] for c in hist]
+            ema5=_ema(closes[-10:],5); ema10=_ema(closes[-10:],10)
+            rsi=_rsi(closes[-15:],14)
+            pp,r1,s1=_pivots(highs[-2],lows[-2],closes[-2])
+            px=closes[-1]
+            if (ema5 and ema10 and ema5>ema10) and (px>r1) and (rsi is not None and rsi<70):
+                bias[nm]="CE"
+            elif (ema5 and ema10 and ema5<ema10) and (px<s1) and (rsi is not None and rsi>30):
+                bias[nm]="PE"
             else:
-                atm = min(strikes, key=lambda s: abs(s - px))
+                bias[nm]="BOTH"
+            last_px[nm]=px
 
-            allowed_types = ("CE","PE") if bias_map.get(nm) == "BOTH" else (bias_map[nm],)
-            ring = _build_ring_strikes(strikes, atm, RING_STRIKES)
-
+        # 4) build candidate ring around ATM
+        candidates=[]
+        for nm in UNDERLYINGS:
+            rows=[r for r in base if r.get("name")==nm]
+            if not rows: continue
+            strikes=sorted({r.get("strike") for r in rows if r.get("strike") is not None})
+            if not strikes: continue
+            atm = min(strikes, key=lambda s: abs(s - last_px[nm])) if last_px[nm] else strikes[len(strikes)//2]
+            ring = _ring(strikes, atm, RING_STRIKES)
+            allowed = ("CE","PE") if bias[nm]=="BOTH" else (bias[nm],)
             for r in rows:
-                if r.get("strike") in ring and r.get("instrument_type") in allowed_types:
-                    ts = r.get("tradingsymbol")
-                    if ts:
-                        candidates.append(("NFO:" + ts, r))
-
-        out["diag"]["candidates"] = len(candidates)
+                if r.get("strike") in ring and r.get("instrument_type") in allowed:
+                    sym = "NFO:" + r["tradingsymbol"]
+                    candidates.append((sym, r))
+        out["diag"]["candidates"]=len(candidates)
         if not candidates:
-            out["errors"].append("No option candidates (ring/side filter empty).")
+            out["errors"].append("No candidates after ring/side filter")
+            return out
 
-        # 4) Quote candidates and score
-        quotes = {}
-        # chunk small to be safe on free tier
+        # 5) quote + rank
+        quotes={}
         for i in range(0, len(candidates), 80):
-            sub = [sym for sym, _ in candidates[i:i+80]]
+            batch=[s for s,_ in candidates[i:i+80]]
             try:
-                q = kite.quote(sub)
-                quotes.update(q or {})
+                q=kite.quote(batch); quotes.update(q or {})
             except Exception as e:
                 out["errors"].append(f"quote error: {str(e)}")
 
-        scored = []
+        scored=[]
         for sym, meta in candidates:
-            q = quotes.get(sym) or {}
-            ltp = q.get("last_price") or 0.0
-            depth = q.get("depth") or {}
-            buy = depth.get("buy") or []
-            sell = depth.get("sell") or []
-            best_bid = buy[0]["price"] if buy else None
-            best_ask = sell[0]["price"] if sell else None
-            lot = meta.get("lot_size") or 1
-            score = _score_option(q, lot, ltp, best_bid, best_ask)
-
-            # budget split: 5 ideas
-            per_pick = max(BUDGET/5.0, 1e-6)
-            lot_cost = (ltp or 0) * lot
-            suggested_lots = int(per_pick // lot_cost) if lot_cost > 0 else 0
-            cap_req = round(suggested_lots * lot_cost, 2)
-
+            q=quotes.get(sym) or {}
+            ltp=q.get("last_price") or 0.0
+            lot=meta.get("lot_size") or 1
+            sc=_score(q, lot, ltp)
+            per=BUDGET/5.0
+            lots=int(per//(ltp*lot)) if ltp>0 else 0
             scored.append({
                 "symbol": sym,
                 "name": meta.get("name"),
@@ -218,20 +152,15 @@ def run_smc_scan(kite):
                 "expiry": str(meta.get("expiry").date()) if meta.get("expiry") else None,
                 "ltp": float(ltp),
                 "lot_size": int(lot),
-                "score": round(score, 6),
-                "suggested_lots": suggested_lots,
-                "capital_required": cap_req,
-                "reason": f"{meta.get('name')} bias={bias_map.get(meta.get('name'),'BOTH')}"
+                "score": round(sc,6),
+                "suggested_lots": lots,
+                "capital_required": round(lots*ltp*lot,2),
+                "reason": f"bias={bias.get(meta.get('name'),'BOTH')}"
             })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        out["picks"] = scored[:5]
-        if not out["picks"]:
-            out["status"] = "degraded"
-            out["errors"].append("No quotes returned; try during market hours or widen RING_STRIKES.")
+        out["picks"]=scored[:5]
         return out
 
     except Exception as e:
-        out["status"] = "error"
-        out["errors"].append(str(e))
-        return out
+        out["status"]="error"; out["errors"].append(str(e)); return out
