@@ -1,8 +1,5 @@
-Flask==3.0.3
-gunicorn==21.2.0
-kiteconnect==4.2.0
-requests==2.31.0
-pandas==2.2.2
-numpy==1.26.4
-python-dotenv==1.0.1
+flask
+requests
+pytz
 numpy
+pandas
