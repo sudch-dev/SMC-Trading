@@ -1,37 +1,65 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SMC Trading Bot | TPMV</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net">
+    <!-- Fixed Bootstrap Link -->
+    <link href="https://cdn.jsdelivr.net" rel="stylesheet">
+    <style>
+        .status-box { transition: all 0.3s ease; }
+        .btn-auth { background-color: #ff5722; color: white; border: none; }
+        .btn-auth:hover { background-color: #e64a19; color: white; }
+    </style>
 </head>
-<body class="bg-light">
+<body class="bg-dark text-light">
     <div class="container mt-5">
-        <div class="card shadow">
-            <div class="card-header bg-primary text-white">
-                <h3 class="mb-0">SMC Trading Dashboard (TPMV)</h3>
-            </div>
-            <div class="card-body text-center">
-                <!-- STEP 1: LOGIN -->
-                <div class="mb-4">
-                    <h5>Step 1: Daily Authentication</h5>
-                    <p class="text-muted">Kite tokens expire daily. Log in before 09:15 AM.</p>
-                    <a href="/login" class="btn btn-warning px-4">Login to Zerodha</a>
-                </div>
+        <div class="row justify-content-center">
+            <div class="col-md-8 col-lg-6">
+                <div class="card shadow-lg border-0 bg-secondary text-white">
+                    <div class="card-header bg-primary text-center py-3">
+                        <h3 class="mb-0">SMC Dashboard (TPMV)</h3>
+                    </div>
+                    <div class="card-body p-4 text-center">
+                        
+                        <!-- STEP 1: LOGIN (Dynamic visibility) -->
+                        <div id="login-section" class="mb-4">
+                            <h5>Step 1: Authenticate</h5>
+                            <p class="small text-light-50">Click to enter Zerodha password & App Code.</p>
+                            <a href="/login" class="btn btn-auth px-4 py-2 fw-bold">Login to Zerodha</a>
+                        </div>
 
-                <!-- STEP 2: BOT CONTROL -->
-                <hr>
-                <div class="mb-4">
-                    <h5>Step 2: Bot Control</h5>
-                    <p>Trading begins automatically at <strong>09:25 AM IST</strong>.</p>
-                    <button onclick="startBot()" class="btn btn-success px-5">Start Bot</button>
-                    <button onclick="stopBot()" class="btn btn-danger px-5">Stop Bot</button>
-                </div>
+                        <!-- STEP 2: BOT CONTROL -->
+                        <div id="control-section" class="mb-4" style="display:none;">
+                            <h5>Step 2: Bot Control</h5>
+                            <p class="small text-light-50">Strategy active from <strong>09:25 AM IST</strong>.</p>
+                            <div class="d-grid gap-2 d-md-block">
+                                <button onclick="startBot()" class="btn btn-success px-4">Start Bot</button>
+                                <button onclick="stopBot()" class="btn btn-danger px-4">Stop Bot</button>
+                            </div>
+                        </div>
 
-                <!-- STATUS PANEL -->
-                <div class="alert alert-info mt-3" id="status-panel">
-                    Status: <span id="bot-status">Checking...</span> | 
-                    Last Update: <span id="last-update">-</span>
+                        <hr class="bg-light">
+
+                        <!-- LIVE STATUS PANEL -->
+                        <div class="status-box alert alert-info py-3 mb-0" id="status-panel">
+                            <div class="row">
+                                <div class="col-6 border-end">
+                                    <small class="d-block text-muted uppercase">Status</small>
+                                    <span id="bot-status" class="fw-bold text-dark">Checking...</span>
+                                </div>
+                                <div class="col-6">
+                                    <small class="d-block text-muted">Last Ping</small>
+                                    <span id="last-update" class="text-dark">-</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- ERROR DISPLAY -->
+                        <div id="error-display" class="mt-3 text-warning small fw-bold" style="display:none;"></div>
+                    </div>
                 </div>
+                <p class="text-center mt-3 text-muted small">URL: https://smc-trading.onrender.com</p>
             </div>
         </div>
     </div>
@@ -40,17 +68,48 @@
         function startBot() {
             fetch('/start', {method: 'POST'})
                 .then(r => r.json())
-                .then(d => alert(d.status === 'started' ? "Bot Started Successfully" : "Error: " + d.reason));
+                .then(d => {
+                    if(d.status === 'started') alert("Bot Engaged for 09:25 AM");
+                    else alert("Error: " + d.reason);
+                });
         }
+
         function stopBot() {
-            fetch('/stop', {method: 'POST'}).then(() => alert("Bot Stopped"));
+            fetch('/stop', {method: 'POST'}).then(() => alert("Bot Halted"));
         }
-        setInterval(() => {
-            fetch('/status').then(r => r.json()).then(data => {
-                document.getElementById('bot-status').innerText = data.status;
-                document.getElementById('last-update').innerText = data.last;
-            });
-        }, 5000);
+
+        function updateUI() {
+            fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    // Update Text
+                    document.getElementById('bot-status').innerText = data.status;
+                    document.getElementById('last-update').innerText = data.last;
+
+                    // Handle Login Visibility (If authenticated, show controls)
+                    if (data.authenticated) {
+                        document.getElementById('login-section').style.display = 'none';
+                        document.getElementById('control-section').style.display = 'block';
+                    } else {
+                        document.getElementById('login-section').style.display = 'block';
+                        document.getElementById('control-section').style.display = 'none';
+                    }
+
+                    // Show Errors if any
+                    const errBox = document.getElementById('error-display');
+                    if (data.error) {
+                        errBox.innerText = "Error: " + data.error;
+                        errBox.style.display = 'block';
+                    } else {
+                        errBox.style.display = 'none';
+                    }
+                })
+                .catch(e => console.log("Waiting for server..."));
+        }
+
+        // Update every 3 seconds for better real-time feel
+        setInterval(updateUI, 3000);
+        updateUI(); // Initial call
     </script>
 </body>
 </html>
