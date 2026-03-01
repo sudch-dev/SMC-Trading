@@ -3,3 +3,5 @@ requests
 pytz
 numpy
 pandas
+kiteconnect
+python-dotenv
