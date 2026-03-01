@@ -1,323 +1,255 @@
 import os
-from flask import Flask, redirect, request, render_template, jsonify
+import time
+import threading
+import requests
+import numpy as np
+import pandas as pd
+from datetime import datetime, time as dtime
+
+from flask import Flask, render_template, jsonify, redirect, request
 from kiteconnect import KiteConnect
 from dotenv import load_dotenv
-from smc_logic import run_smc_scan  # scanner
-
-# extras for recording + rounding
-import json
-from pathlib import Path
-from datetime import datetime
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# ------------ Config ------------
-API_KEY = os.getenv("API_KEY", "")
-API_SECRET = os.getenv("API_SECRET", "")
+# ================= CONFIG =================
 
-# safety switch for live orders
-ALLOW_ORDER_EXEC = os.getenv("ALLOW_ORDER_EXEC", "0") in ("1", "true", "True")
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+BUDGET = float(os.getenv("BUDGET", 10000))
 
-# NRML recommended for AMO in NFO
-PRODUCT_DEFAULT = os.getenv("PRODUCT", "NRML")  # NRML or MIS
-
-# option tick size (₹) for rounding prices
-OPT_TICK = float(os.getenv("OPT_TICK", "0.05"))
-
-# AMO fallback controls
-ALLOW_AMO = os.getenv("ALLOW_AMO", "1") in ("1", "true", "True")
-AMO_FALLBACK_PATTERNS = (
-    "after market order",
-    "amo",
-    "market is closed",
-    "outside market hours",
-    "could not be converted",
-    "not allowed during market closed",
-)
+BASE_URL = "https://smc-trading.onrender.com"
 
 kite = KiteConnect(api_key=API_KEY)
 
-access_token = None
-smc_status = {}
+if ACCESS_TOKEN:
+    kite.set_access_token(ACCESS_TOKEN)
 
+running = False
+status = {"state": "Stopped", "error": "", "last": ""}
 
-# ------------ Helpers ------------
-def _tick_round(x, tick=0.05):
-    if x is None:
-        return None
-    return round(round(float(x) / tick) * tick, 2)
+SYMBOLS = ["TATAMOTORS", "ADANIENT"]
+instrument_tokens = {}
 
+# ================= KEEP ALIVE =================
 
-def _compute_limit_from_quote(tradingsymbol, action):
-    """Choose a LIMIT price from best bid/ask (LTP fallback), tick-rounded."""
-    q = {}
-    try:
-        q = kite.quote([f"NFO:{tradingsymbol}"]) or {}
-        q = q.get(f"NFO:{tradingsymbol}", {})
-    except Exception:
-        q = {}
-    ltp = q.get("last_price")
-    depth = q.get("depth") or {}
-    best_buy = (depth.get("buy") or [{}])[0].get("price")
-    best_sell = (depth.get("sell") or [{}])[0].get("price")
+def self_keepalive():
+    while True:
+        try:
+            requests.get("https://smc-trading.onrender.com")
+        except:
+            pass
+        time.sleep(240)
 
-    ref = (best_sell if action == "BUY" else best_buy) or ltp
-    if ref is None:
-        return None, {"ltp": None, "best_buy": None, "best_sell": None}
+threading.Thread(target=self_keepalive, daemon=True).start()
 
-    price = _tick_round(ref, OPT_TICK)
-    snap = {"ltp": ltp, "best_buy": best_buy, "best_sell": best_sell}
-    return price, snap
-
-
-def _record_entry(symbol, action, qty, chosen_price, quote_snapshot, extra=None):
-    rec = {
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol": symbol,
-        "action": action,
-        "qty": qty,
-        "chosen_price": chosen_price,
-        "quote": quote_snapshot or {},
-    }
-    if extra:
-        rec.update(extra)
-    path = Path("entry_records.json")
-    try:
-        data = json.loads(path.read_text()) if path.exists() else []
-        data.append(rec)
-        path.write_text(json.dumps(data, indent=2))
-    except Exception:
-        pass
-
-
-# ------------ Routes ------------
-@app.route("/")
-def home():
-    return redirect("/login")
-
+# ================= LOGIN =================
 
 @app.route("/login")
 def login():
-    login_url = kite.login_url()
-    return redirect(login_url)
-
+    return redirect(kite.login_url())
 
 @app.route("/callback")
 def callback():
-    global access_token
-    request_token = request.args.get("request_token")
-    if not request_token:
-        return "Missing request_token", 400
-    data = kite.generate_session(request_token, api_secret=API_SECRET)
-    access_token = data["access_token"]
-    kite.set_access_token(access_token)
-    return redirect("/dashboard")
+    global ACCESS_TOKEN
 
+    req_token = request.args.get("request_token")
+    data = kite.generate_session(req_token, api_secret=API_SECRET)
 
-@app.route("/dashboard")
-def dashboard():
-    return render_template("index.html")
+    ACCESS_TOKEN = data["access_token"]
+    os.environ["ACCESS_TOKEN"] = ACCESS_TOKEN
+    kite.set_access_token(ACCESS_TOKEN)
 
+    return "Login successful. Token stored for session."
 
-@app.route("/api/health")
-def api_health():
-    return {"ok": True, "logged_in": bool(access_token)}
+# ================= MAP INSTRUMENTS =================
 
+def map_instruments():
+    global instrument_tokens
+    instruments = kite.instruments("NSE")
 
-@app.route("/api/smc-status")
-def api_smc_status():
-    """
-    Always return JSON (even on errors) so the frontend never sees HTML 500.
-    """
-    global smc_status
-    if not access_token:
-        return jsonify({
-            "status": "error",
-            "error": "Not logged in. Please complete Kite login.",
-            "picks": [],
-            "diag": {},
-            "errors": ["no_access_token"]
-        }), 401
+    for ins in instruments:
+        if ins["tradingsymbol"] in SYMBOLS:
+            instrument_tokens[ins["tradingsymbol"]] = ins["instrument_token"]
 
-    try:
-        kite.set_access_token(access_token)
-        smc_status = run_smc_scan(kite) or {}
-        return jsonify(smc_status)
-    except Exception as e:
-        err = str(e)
-        return jsonify({
-            "status": "error",
-            "error": err,
-            "picks": [],
-            "diag": {},
-            "errors": [err]
-        }), 500
+# ================= DATA =================
 
+def get_data(symbol):
+    token = instrument_tokens[symbol]
 
-@app.route("/api/execute", methods=["POST"])
-def api_execute():
-    """
-    Entry is always placed as LIMIT.
-    TP = LIMIT. SL = stop-loss LIMIT (SL).
-    If market is closed & ALLOW_AMO=1 -> fallback to VARIETY_AMO for ENTRY ONLY,
-    and skip TP/SL legs.
-    """
-    if not ALLOW_ORDER_EXEC:
-        return jsonify({"status": "error",
-                        "error": "Order execution disabled. Set ALLOW_ORDER_EXEC=1"}), 403
-    if not access_token:
-        return jsonify({"status": "error", "error": "Not logged in."}), 401
+    data = kite.historical_data(
+        token,
+        datetime.now().replace(hour=9, minute=15),
+        datetime.now(),
+        "5minute"
+    )
 
-    kite.set_access_token(access_token)
-    payload = request.get_json(force=True) or {}
+    return pd.DataFrame(data)
 
-    try:
-        symbol_full = payload.get("symbol", "")
-        tradingsymbol = (
-            symbol_full.split(":", 1)[1] if symbol_full.startswith("NFO:") else symbol_full
-        )
+# ================= INSTITUTIONAL AI =================
 
-        qty = int(payload.get("quantity", 0))
-        action = (payload.get("action", "")).upper()  # legacy fallback
-        trade_type = (payload.get("trade_type") or "").upper()  # LONG / SHORT
-        opt_side = (payload.get("type") or "").upper()  # CE / PE (for logging)
+def compute_signal(df):
 
-        # derive action from trade_type to avoid drift
-        if trade_type in ("LONG", "SHORT"):
-            action = "BUY" if trade_type == "LONG" else "SELL"
+    if len(df) < 10:
+        return None
 
-        order_type_req = (payload.get("order_type", "LIMIT")).upper()
-        product = payload.get("product", PRODUCT_DEFAULT)
-        price_req = payload.get("price")
+    price = df["close"].iloc[-1]
 
-        if action not in ("BUY", "SELL"):
-            return jsonify({"status": "error", "error": "Invalid action"}), 400
-        if qty <= 0:
-            return jsonify({"status": "error", "error": "Quantity must be > 0"}), 400
+    vwap = (df["volume"] *
+           (df["high"] + df["low"] + df["close"]) / 3).cumsum() \
+           / df["volume"].cumsum()
 
-        # Force LIMIT entry — client price or derived from quote
-        if order_type_req == "LIMIT" and price_req is not None:
-            chosen_price = _tick_round(price_req, OPT_TICK)
-            quote_snap = {"from": "client_price"}
-        else:
-            chosen_price, quote_snap = _compute_limit_from_quote(tradingsymbol, action)
-        if chosen_price is None:
-            return jsonify({"status": "error",
-                            "error": "Unable to derive limit price from quote"}), 502
+    vwap = vwap.iloc[-1]
 
-        # ---------- ENTRY: try REGULAR first, then AMO fallback ----------
-        entry_kwargs = dict(
-            variety=KiteConnect.VARIETY_REGULAR,
-            exchange=KiteConnect.EXCHANGE_NFO,
-            tradingsymbol=tradingsymbol,
-            transaction_type=action,
-            quantity=qty,
-            product=product,
-            order_type=KiteConnect.ORDER_TYPE_LIMIT,
-            validity=KiteConnect.VALIDITY_DAY,
-            price=float(chosen_price),
-        )
+    vol_ratio = df["volume"].iloc[-1] / \
+                df["volume"].rolling(5).mean().iloc[-1]
 
-        entry_id = None
-        queued_as_amo = False
-        amo_note = None
+    slope = df["close"].iloc[-1] - df["close"].iloc[-4]
+
+    score = 0.4*slope + 0.4*vol_ratio + 0.2*(price - vwap)
+
+    prob = 1 / (1 + np.exp(-score))
+    prob = 0.75 * prob + 0.125
+
+    if prob > 0.68:
+        return "BUY"
+
+    if prob < 0.32:
+        return "SELL"
+
+    return None
+
+# ================= POSITION SIZE =================
+
+def calc_qty(price):
+    risk = BUDGET * 0.006
+    stop = price * 0.005
+    qty = int(risk / stop)
+    return max(qty, 1)
+
+# ================= ORDER =================
+
+def place_order(symbol, side, price):
+
+    qty = calc_qty(price)
+
+    if os.getenv("ALLOW_ORDER_EXEC") != "1":
+        return
+
+    kite.place_order(
+        exchange="NSE",
+        tradingsymbol=symbol,
+        transaction_type=side,
+        quantity=qty,
+        order_type="MARKET",
+        product="MIS",
+        variety="regular"
+    )
+
+# ================= SQUARE OFF =================
+
+def square_off_all():
+
+    positions = kite.positions()["net"]
+
+    for p in positions:
+
+        if p["quantity"] != 0:
+
+            side = "SELL" if p["quantity"] > 0 else "BUY"
+
+            kite.place_order(
+                exchange="NSE",
+                tradingsymbol=p["tradingsymbol"],
+                transaction_type=side,
+                quantity=abs(p["quantity"]),
+                order_type="MARKET",
+                product="MIS"
+            )
+
+# ================= MAIN LOOP =================
+
+def bot_loop():
+
+    global running, status
+
+    map_instruments()
+
+    while running:
+
+        now = datetime.now().time()
 
         try:
-            entry_id = kite.place_order(**entry_kwargs)
-        except Exception as ex:
-            msg = str(ex).lower()
-            if ALLOW_AMO and any(pat in msg for pat in AMO_FALLBACK_PATTERNS):
-                try:
-                    amo_kwargs = dict(entry_kwargs)
-                    amo_kwargs["variety"] = KiteConnect.VARIETY_AMO
-                    entry_id = kite.place_order(**amo_kwargs)
-                    queued_as_amo = True
-                    amo_note = "Entry queued as AMO (market closed). TP/SL legs were skipped."
-                except Exception as ex2:
-                    return jsonify({"status": "error", "error": f"AMO failed: {str(ex2)}"}), 400
-            else:
-                return jsonify({"status": "error", "error": str(ex)}), 400
 
-        # audit trail
-        _record_entry(
-            tradingsymbol, action, qty, chosen_price, quote_snap,
-            extra={"entry_order_id": entry_id, "trade_type": trade_type,
-                   "type": opt_side, "queued_as_amo": queued_as_amo}
-        )
+            if dtime(9,25) <= now <= dtime(14,50):
 
-        resp = {
-            "status": "ok",
-            "entry_order_id": entry_id,
-            "tp_order_id": None,
-            "sl_order_id": None,
-            "used_limit_price": chosen_price,
-        }
-        if amo_note:
-            resp["note"] = amo_note
+                for sym in SYMBOLS:
 
-        # ---------- Optional exits ----------
-        # Skip exits when AMO; add later after market opens if needed
-        if payload.get("with_tp_sl") and not queued_as_amo:
-            tp = payload.get("tp")
-            sl = payload.get("sl")
+                    df = get_data(sym)
+                    signal = compute_signal(df)
 
-            if tp is not None:
-                tp_price = _tick_round(tp, OPT_TICK)
-                exit_tp_kwargs = dict(
-                    variety=KiteConnect.VARIETY_REGULAR,
-                    exchange=KiteConnect.EXCHANGE_NFO,
-                    tradingsymbol=tradingsymbol,
-                    transaction_type=("SELL" if action == "BUY" else "BUY"),
-                    quantity=qty,
-                    product=product,
-                    order_type=KiteConnect.ORDER_TYPE_LIMIT,
-                    price=float(tp_price),
-                    validity=KiteConnect.VALIDITY_DAY,
-                )
-                try:
-                    resp["tp_order_id"] = kite.place_order(**exit_tp_kwargs)
-                    resp["tp_price"] = tp_price
-                except Exception as e:
-                    resp["tp_error"] = str(e)
+                    if signal:
+                        price = df["close"].iloc[-1]
+                        place_order(sym, signal, price)
 
-            if sl is not None:
-                sl_trig = _tick_round(sl, OPT_TICK)
-                sl_price = _tick_round(
-                    (sl_trig - OPT_TICK) if action == "BUY" else (sl_trig + OPT_TICK),
-                    OPT_TICK,
-                )
-                exit_sl_kwargs = dict(
-                    variety=KiteConnect.VARIETY_REGULAR,
-                    exchange=KiteConnect.EXCHANGE_NFO,
-                    tradingsymbol=tradingsymbol,
-                    transaction_type=("SELL" if action == "BUY" else "BUY"),
-                    quantity=qty,
-                    product=product,
-                    order_type=KiteConnect.ORDER_TYPE_SL,
-                    price=float(sl_price),
-                    trigger_price=float(sl_trig),
-                    validity=KiteConnect.VALIDITY_DAY,
-                )
-                try:
-                    resp["sl_order_id"] = kite.place_order(**exit_sl_kwargs)
-                    resp["sl_price"] = sl_price
-                    resp["sl_trigger"] = sl_trig
-                except Exception as e:
-                    resp["sl_error"] = str(e)
+            if now >= dtime(15,10):
+                square_off_all()
 
-        if queued_as_amo:
-            resp["tp_error"] = resp.get("tp_error") or "Skipped because entry is AMO"
-            resp["sl_error"] = resp.get("sl_error") or "Skipped because entry is AMO"
+        except Exception as e:
+            status["error"] = str(e)
 
-        return jsonify(resp)
+        status["last"] = datetime.now().strftime("%H:%M:%S")
+        time.sleep(60)
 
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+# ================= CONTROL =================
 
+@app.route("/start")
+def start():
+    global running, status
+
+    if not running:
+        running = True
+        status["state"] = "Running"
+        threading.Thread(target=bot_loop, daemon=True).start()
+
+    return "Started"
+
+@app.route("/stop")
+def stop():
+    global running, status
+    running = False
+    status["state"] = "Stopped"
+    return "Stopped"
+
+@app.route("/status")
+def get_status():
+
+    portfolio = {"INR": 0}
+
+    try:
+        margins = kite.margins()["equity"]
+        portfolio["INR"] = margins["available"]["cash"]
+    except:
+        pass
+
+    return jsonify({
+        "status": status["state"],
+        "last": status["last"],
+        "error": status["error"],
+        "portfolio": portfolio
+    })
+
+# ================= UI =================
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+# ================= RUN =================
 
 if __name__ == "__main__":
-    # Keep memory low; single worker recommended on Render free
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
