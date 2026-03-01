@@ -1,73 +1,56 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<title>NSE Institutional AI Bot</title>
-
-<style>
-body{
-  font-family: Arial;
-  background:#0b0f1a;
-  color:white;
-  text-align:center;
-  padding-top:40px;
-}
-
-button{
-  padding:12px 25px;
-  margin:10px;
-  font-size:18px;
-  border:none;
-  border-radius:6px;
-  cursor:pointer;
-}
-
-.start{background:#00c853}
-.stop{background:#d50000}
-
-#status{
-  margin-top:30px;
-  font-size:20px;
-}
-</style>
+    <title>SMC Trading Bot | TPMV</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net">
 </head>
+<body class="bg-light">
+    <div class="container mt-5">
+        <div class="card shadow">
+            <div class="card-header bg-primary text-white">
+                <h3 class="mb-0">SMC Trading Dashboard (TPMV)</h3>
+            </div>
+            <div class="card-body text-center">
+                <!-- STEP 1: LOGIN -->
+                <div class="mb-4">
+                    <h5>Step 1: Daily Authentication</h5>
+                    <p class="text-muted">Kite tokens expire daily. Log in before 09:15 AM.</p>
+                    <a href="/login" class="btn btn-warning px-4">Login to Zerodha</a>
+                </div>
 
-<body>
+                <!-- STEP 2: BOT CONTROL -->
+                <hr>
+                <div class="mb-4">
+                    <h5>Step 2: Bot Control</h5>
+                    <p>Trading begins automatically at <strong>09:25 AM IST</strong>.</p>
+                    <button onclick="startBot()" class="btn btn-success px-5">Start Bot</button>
+                    <button onclick="stopBot()" class="btn btn-danger px-5">Stop Bot</button>
+                </div>
 
-<h1>🏦 Institutional AI Trading Bot</h1>
+                <!-- STATUS PANEL -->
+                <div class="alert alert-info mt-3" id="status-panel">
+                    Status: <span id="bot-status">Checking...</span> | 
+                    Last Update: <span id="last-update">-</span>
+                </div>
+            </div>
+        </div>
+    </div>
 
-<button class="start" onclick="start()">Start</button>
-<button class="stop" onclick="stop()">Stop</button>
-
-<div id="status">Loading...</div>
-
-<script>
-
-function start(){
-  fetch("/start")
-}
-
-function stop(){
-  fetch("/stop")
-}
-
-function update(){
-
-  fetch("/status")
-  .then(r=>r.json())
-  .then(d=>{
-
-    document.getElementById("status").innerHTML =
-      "Status: " + d.status +
-      "<br>Last: " + d.last +
-      "<br>Error: " + d.error +
-      "<br>Cash: ₹" + d.portfolio.INR
-  })
-}
-
-setInterval(update, 3000)
-update()
-
-</script>
-
+    <script>
+        function startBot() {
+            fetch('/start', {method: 'POST'})
+                .then(r => r.json())
+                .then(d => alert(d.status === 'started' ? "Bot Started Successfully" : "Error: " + d.reason));
+        }
+        function stopBot() {
+            fetch('/stop', {method: 'POST'}).then(() => alert("Bot Stopped"));
+        }
+        setInterval(() => {
+            fetch('/status').then(r => r.json()).then(data => {
+                document.getElementById('bot-status').innerText = data.status;
+                document.getElementById('last-update').innerText = data.last;
+            });
+        }, 5000);
+    </script>
 </body>
 </html>
