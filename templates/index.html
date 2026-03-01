@@ -1,52 +1,73 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <title>SMC Dashboard</title>
-  <script defer src="/static/script.js"></script>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
-    h1 { margin-bottom: 8px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; }
-    .card h2 { margin: 0 0 8px 0; font-size: 16px; }
-    ul { padding-left: 18px; margin: 0; }
-    li { margin: 8px 0; }
-    .muted { color: #6b7280; }
-    .err { color: #b91c1c; }
-    .btn { padding: 4px 8px; border: 1px solid #111827; border-radius: 6px; background: #fff; cursor: pointer; }
-    input[type="number"] { width: 80px; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .pill { font-size: 12px; padding: 1px 6px; border-radius: 999px; background: #eef2ff; margin-left: 6px; }
-  </style>
+<title>NSE Institutional AI Bot</title>
+
+<style>
+body{
+  font-family: Arial;
+  background:#0b0f1a;
+  color:white;
+  text-align:center;
+  padding-top:40px;
+}
+
+button{
+  padding:12px 25px;
+  margin:10px;
+  font-size:18px;
+  border:none;
+  border-radius:6px;
+  cursor:pointer;
+}
+
+.start{background:#00c853}
+.stop{background:#d50000}
+
+#status{
+  margin-top:30px;
+  font-size:20px;
+}
+</style>
 </head>
+
 <body>
-  <h1>SMC Scanner — NIFTY-50 Options</h1>
-  <div class="muted" id="meta">Loading…</div>
 
-  <div class="grid" style="margin-top:16px;">
-    <div class="card">
-      <h2>📈 Long Calls (CE)</h2>
-      <ul id="long-ce"></ul>
-    </div>
-    <div class="card">
-      <h2>📉 Short Calls (CE)</h2>
-      <ul id="short-ce"></ul>
-    </div>
-    <div class="card">
-      <h2>📈 Long Puts (PE)</h2>
-      <ul id="long-pe"></ul>
-    </div>
-    <div class="card">
-      <h2>📉 Short Puts (PE)</h2>
-      <ul id="short-pe"></ul>
-    </div>
-  </div>
+<h1>🏦 Institutional AI Trading Bot</h1>
 
-  <div class="card" style="margin-top:16px;">
-    <h2>Diagnostics</h2>
-    <pre id="diag" class="muted" style="white-space:pre-wrap;"></pre>
-    <div id="errors" class="err"></div>
-  </div>
+<button class="start" onclick="start()">Start</button>
+<button class="stop" onclick="stop()">Stop</button>
+
+<div id="status">Loading...</div>
+
+<script>
+
+function start(){
+  fetch("/start")
+}
+
+function stop(){
+  fetch("/stop")
+}
+
+function update(){
+
+  fetch("/status")
+  .then(r=>r.json())
+  .then(d=>{
+
+    document.getElementById("status").innerHTML =
+      "Status: " + d.status +
+      "<br>Last: " + d.last +
+      "<br>Error: " + d.error +
+      "<br>Cash: ₹" + d.portfolio.INR
+  })
+}
+
+setInterval(update, 3000)
+update()
+
+</script>
+
 </body>
 </html>
