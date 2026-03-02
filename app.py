@@ -1,141 +1,129 @@
-import os, time, threading, requests, statistics
+import os, time, threading, statistics
 from flask import Flask, render_template, jsonify, redirect, request
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pytz import timezone
 from kiteconnect import KiteConnect
 
 app = Flask(__name__)
 
-# ========= CONFIG (SMC/Kite Terminology) =========
+# ========= CONFIG =========
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET")
-# access_token is set via the /callback route daily
-ACCESS_TOKEN = os.environ.get("access_token") 
+ACCESS_TOKEN = None 
 
 kite = KiteConnect(api_key=API_KEY)
-if ACCESS_TOKEN:
-    kite.set_access_token(ACCESS_TOKEN)
-
-TRADING_SYMBOL = "TPMV"
-EXCHANGE = "NSE"
 IST = timezone("Asia/Kolkata")
 
+SCRIPTS = ["HDFCBANK", "INFY", "RELIANCE", "BHARTIARTL", "TCS"]
+EXCHANGE = "NSE"
+MAX_TOTAL_MARGIN = 5000 
+MARGIN_PER_STOCK = MAX_TOTAL_MARGIN // len(SCRIPTS)
+
+# Global State
 running = False
-error_message = ""
-status = {"msg": "Idle", "last": ""}
-prices = []
-entry = None
+status = {"msg": "Idle", "last": "-", "pnl": 0, "funds": 0}
+portfolio = {s: {"prices": [], "entry": None, "trades": 0} for s in SCRIPTS}
 
-# ========= AUTH & LOGIN FLOW =========
-
+# ========= AUTH =========
 @app.route("/login")
-def login():
-    """Step 1: Redirect user to Zerodha's login page"""
-    return redirect(kite.login_url())
+def login(): return redirect(kite.login_url())
 
 @app.route("/callback")
 def callback():
-    """Step 2: Catch the request_token and generate daily access_token"""
-    global ACCESS_TOKEN, error_message
-    request_token = request.args.get("request_token")
+    global ACCESS_TOKEN
+    token = request.args.get("request_token")
     try:
-        data = kite.generate_session(request_token, api_secret=API_SECRET)
+        data = kite.generate_session(token, api_secret=API_SECRET)
         ACCESS_TOKEN = data["access_token"]
         kite.set_access_token(ACCESS_TOKEN)
-        status["msg"] = "Authenticated"
-        error_message = ""
-        return redirect("/") # Redirect back to home dashboard
-    except Exception as e:
-        error_message = f"Login Failed: {str(e)}"
         return redirect("/")
+    except: return "Auth Failed"
 
-# ========= MARKET & ENGINE (09:25 Entry) =========
-
-def get_price():
-    try:
-        res = kite.ltp(f"{EXCHANGE}:{TRADING_SYMBOL}")
-        return res[f"{EXCHANGE}:{TRADING_SYMBOL}"]["last_price"]
-    except: return None
+# ========= TRADING LOGIC =========
 
 def bot_loop():
-    global running, error_message, entry
+    global running
     while running:
         try:
             now = datetime.now(IST)
-            current_time = now.strftime("%H:%M")
-
-            # Market Hours check (09:15 - 15:30)
-            if not ("09:15" <= current_time <= "15:30"):
+            # Market check
+            if not (dt_time(9, 25) <= now.time() <= dt_time(15, 20)):
                 status["msg"] = "Market Closed"
-                time.sleep(60); continue
+                time.sleep(30); continue
 
-            price = get_price()
-            if price:
-                prices.append(price)
-                if len(prices) > 100: prices.pop(0)
+            # 1. Update Global Funds & P&L
+            margins = kite.margins()
+            status["funds"] = margins["equity"]["available"]["cash"]
+            
+            query = [f"{EXCHANGE}:{s}" for s in SCRIPTS]
+            quotes = kite.ltp(query)
+            total_pnl = 0
 
-                # TRIGGER ENTRY AT 09:25 AM
-                if current_time >= "09:25" and not entry:
-                    if len(prices) > 20 and price > statistics.mean(prices[-20:]):
-                        order_id = kite.place_order(
-                            variety=kite.VARIETY_REGULAR,
-                            exchange=kite.EXCHANGE_NSE,
-                            tradingsymbol=TRADING_SYMBOL,
-                            transaction_type=kite.TRANSACTION_TYPE_BUY,
-                            quantity=1,
-                            product=kite.PRODUCT_MIS,
-                            order_type=kite.ORDER_TYPE_MARKET
-                        )
-                        entry = {"id": order_id, "price": price}
+            for symbol in SCRIPTS:
+                full_sym = f"{EXCHANGE}:{symbol}"
+                price = quotes[full_sym]["last_price"]
+                data = portfolio[symbol]
+                data["prices"].append(price)
+                if len(data["prices"]) > 50: data["prices"].pop(0)
 
-            status["msg"] = "Running" if not entry else "In Trade"
+                # 2. Manage Position
+                if data["entry"]:
+                    trade = data["entry"]
+                    # Calculate Unrealized P&L
+                    pnl = (price - trade["price"]) * trade["qty"]
+                    total_pnl += pnl
+
+                    # Exit Logic (SL 0.5% / TP 1.0%)
+                    if price <= trade["sl"] or price >= trade["tp"]:
+                        kite.place_order(variety=kite.VARIETY_REGULAR, exchange=EXCHANGE, tradingsymbol=symbol,
+                                         transaction_type=kite.TRANSACTION_TYPE_SELL, quantity=trade["qty"],
+                                         product=kite.PRODUCT_MIS, order_type=kite.ORDER_TYPE_MARKET)
+                        data["entry"] = None
+                
+                # 3. Entry Logic (EMA Pullback)
+                elif len(data["prices"]) >= 20:
+                    ema = statistics.mean(data["prices"][-20:])
+                    if price > ema and price <= ema * 1.001:
+                        qty = int(MARGIN_PER_STOCK / price)
+                        order_id = kite.place_order(variety=kite.VARIETY_REGULAR, exchange=EXCHANGE, tradingsymbol=symbol,
+                                                    transaction_type=kite.TRANSACTION_TYPE_BUY, quantity=max(1, qty),
+                                                    product=kite.PRODUCT_MIS, order_type=kite.ORDER_TYPE_MARKET)
+                        
+                        # Fetch Exchange Order ID
+                        order_history = kite.order_history(order_id)
+                        exchange_id = order_history[-1].get("exchange_order_id", "PENDING")
+                        
+                        data["entry"] = {
+                            "ex_id": exchange_id, "qty": qty, "price": price,
+                            "sl": price * 0.995, "tp": price * 1.01
+                        }
+
+            status["pnl"] = round(total_pnl, 2)
+            status["msg"] = "Professional Loop Active"
             status["last"] = now.strftime("%H:%M:%S")
-        except Exception as e:
-            error_message = f"Loop Error: {str(e)}"
-        time.sleep(5)
 
-# ========= ROUTES =========
+        except Exception as e: status["msg"] = f"Err: {str(e)[:20]}"
+        time.sleep(10)
 
+# ========= API ROUTES =========
 @app.route("/")
-def home():
-    return render_template("index.html")
+def home(): return render_template("index.html")
 
 @app.route("/status")
 def stat():
     return jsonify({
-        "status": status["msg"],
-        "last": status["last"],
+        "status": status,
         "authenticated": bool(ACCESS_TOKEN),
-        "error": error_message
+        "scripts": {s: portfolio[s]["entry"] if portfolio[s]["entry"] else "Watching" for s in SCRIPTS}
     })
 
 @app.route("/start", methods=["POST"])
 def start():
     global running
-    if not ACCESS_TOKEN: return jsonify({"status": "failed", "reason": "No access_token"})
-    if not running:
+    if ACCESS_TOKEN and not running:
         running = True
         threading.Thread(target=bot_loop, daemon=True).start()
     return jsonify({"status": "started"})
 
-@app.route("/stop", methods=["POST"])
-def stop():
-    global running
-    running = False
-    return jsonify({"status": "stopped"})
-
-@app.route("/ping")
-def ping(): return "pong"
-
-def self_keepalive():
-    """Prevents Render from sleeping"""
-    while True:
-        try: requests.get("https://smc-trading.onrender.com", timeout=10)
-        except: pass
-        time.sleep(240)
-
-threading.Thread(target=self_keepalive, daemon=True).start()
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
