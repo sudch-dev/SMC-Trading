@@ -138,7 +138,7 @@ def self_keepalive():
     while True:
         try:
             # Pings the /ping route specifically
-            requests.get("https://coin-4k37.onrender.com", timeout=10)
+            requests.get("https://smc-trading.onrender.com", timeout=10)
         except: pass
         time.sleep(240)
 
