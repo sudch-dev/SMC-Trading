@@ -53,7 +53,7 @@ def bot_loop():
 
             # 1. Update Global Funds & P&L
             margins = kite.margins()
-            status["funds"] = margins["equity"]["available"]["cash"]
+            status["funds"] = margins["equity"]["available"]["opening_balance"]
             
             query = [f"{EXCHANGE}:{s}" for s in SCRIPTS]
             quotes = kite.ltp(query)
