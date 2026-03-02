@@ -1,5 +1,7 @@
 flask
 kiteconnect
 requests
-pytz
+pandas
+numpy
+scikit-learn
 gunicorn
