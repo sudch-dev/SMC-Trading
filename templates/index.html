@@ -1,77 +1,137 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>SMC AI ML Trading Engine</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {
-            font-family: Arial;
-            background: #0f172a;
-            color: white;
-            text-align: center;
-        }
-        button {
-            padding: 10px 20px;
-            margin: 10px;
-            border-radius: 8px;
-            border: none;
-            cursor: pointer;
-        }
-        .login { background: #2563eb; color: white; }
-        .start { background: #16a34a; color: white; }
-        .stop { background: #dc2626; color: white; }
-        table {
-            margin: auto;
-            border-collapse: collapse;
-            width: 90%;
-        }
-        th, td {
-            border: 1px solid #334155;
-            padding: 8px;
-        }
-        th {
-            background: #1e293b;
-        }
-    </style>
+<meta charset="UTF-8">
+<title>AI Trading Engine</title>
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+body {
+    font-family: Arial, sans-serif;
+    background: #0f172a;
+    color: #e5e7eb;
+    text-align: center;
+    padding: 20px;
+}
+
+h1 {
+    color: #22c55e;
+}
+
+.card {
+    background: #1e293b;
+    padding: 18px;
+    margin: 15px auto;
+    border-radius: 12px;
+    max-width: 600px;
+}
+
+button {
+    padding: 12px 18px;
+    margin: 6px;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+.login { background: #2563eb; color: white; }
+.square { background: #ef4444; color: white; }
+.refresh { background: #22c55e; color: black; }
+
+pre {
+    text-align: left;
+    overflow-x: auto;
+    background: #020617;
+    padding: 10px;
+    border-radius: 8px;
+}
+</style>
 </head>
+
 <body>
 
-<h2>SMC AI ML Trading Engine</h2>
+<h1>🤖 AI Auto Trading Engine</h1>
+
+<div class="card">
 
 {% if not auth %}
+    <p>Not authenticated</p>
     <a href="/login">
-        <button class="login">Login to Zerodha</button>
+        <button class="login">Login to Broker</button>
     </a>
 {% else %}
-    <button onclick="start()" class="start">Start Trading</button>
-    <button onclick="stop()" class="stop">Stop Trading</button>
+    <p style="color:#22c55e;">Authenticated ✔</p>
 {% endif %}
 
-<h3>Live Positions</h3>
-<table>
-    <tr>
-        <th>Symbol</th>
-        <th>Qty</th>
-        <th>Avg Price</th>
-        <th>PnL</th>
-    </tr>
-    {% for p in positions %}
-    <tr>
-        <td>{{p.tradingsymbol}}</td>
-        <td>{{p.quantity}}</td>
-        <td>{{p.average_price}}</td>
-        <td>{{p.pnl}}</td>
-    </tr>
-    {% endfor %}
-</table>
+</div>
+
+
+<div class="card">
+    <h3>Manual Controls</h3>
+
+    <button class="square" onclick="squareOff()">Square Off All</button>
+    <button class="refresh" onclick="loadAll()">Refresh Data</button>
+
+    <p id="status"></p>
+</div>
+
+
+<div class="card">
+    <h3>Open Positions</h3>
+    <pre id="positions">Loading...</pre>
+</div>
+
+
+<div class="card">
+    <h3>Order Book</h3>
+    <pre id="orders">Loading...</pre>
+</div>
+
 
 <script>
-function start(){
-    fetch("/start").then(res => res.text()).then(data => alert(data));
+
+async function loadPositions() {
+    try {
+        const res = await fetch("/positions");
+        const data = await res.json();
+        document.getElementById("positions").textContent =
+            JSON.stringify(data, null, 2);
+    } catch {
+        document.getElementById("positions").textContent = "Error loading positions";
+    }
 }
-function stop(){
-    fetch("/stop").then(res => res.text()).then(data => alert(data));
+
+async function loadOrders() {
+    try {
+        const res = await fetch("/orders");
+        const data = await res.json();
+        document.getElementById("orders").textContent =
+            JSON.stringify(data, null, 2);
+    } catch {
+        document.getElementById("orders").textContent = "Error loading orders";
+    }
 }
+
+async function squareOff() {
+    document.getElementById("status").innerText = "Squaring off...";
+    await fetch("/squareoff");
+    document.getElementById("status").innerText = "Done";
+    loadAll();
+}
+
+function loadAll() {
+    loadPositions();
+    loadOrders();
+}
+
+// Auto refresh every 15 seconds
+setInterval(loadAll, 15000);
+
+// Initial load
+loadAll();
+
 </script>
 
 </body>
