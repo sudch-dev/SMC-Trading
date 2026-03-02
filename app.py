@@ -70,6 +70,7 @@ def ml_logic_gate(prices):
 
     return 0
 
+
 # ========= TRADING BOT =========
 
 def bot_loop():
@@ -79,19 +80,17 @@ def bot_loop():
         try:
             now = datetime.now(IST)
 
-            # Market hours
+            # Trade only during market hours
             if not (dt_time(9, 15) <= now.time() <= dt_time(15, 20)):
                 status["msg"] = "Market Closed"
                 time.sleep(30)
                 continue
 
-            # Fetch funds
             margins = kite.margins()
             status["funds"] = margins.get("equity", {}) \
                                      .get("available", {}) \
                                      .get("live_balance", 0)
 
-            # Fetch prices
             query = [f"{EXCHANGE}:{s}" for s in SCRIPTS]
             quotes = kite.ltp(query)
 
@@ -110,7 +109,7 @@ def bot_loop():
                 if len(data["prices"]) > 60:
                     data["prices"].pop(0)
 
-                # ===== Manage open position =====
+                # ===== Manage open trade =====
                 if data["entry"]:
                     trade = data["entry"]
 
@@ -188,7 +187,8 @@ def bot_loop():
 
         time.sleep(10)
 
-# ========= KEEP ALIVE =========
+
+# ========= KEEP ALIVE (as requested) =========
 
 def self_keepalive():
     while True:
@@ -201,9 +201,11 @@ def self_keepalive():
             pass
         time.sleep(240)
 
-# Start keep-alive thread safely on Render
+
+# Start keep-alive thread on Render
 if os.environ.get("RENDER"):
     threading.Thread(target=self_keepalive, daemon=True).start()
+
 
 # ========= ROUTES =========
 
@@ -211,9 +213,11 @@ if os.environ.get("RENDER"):
 def home():
     return render_template("index.html")
 
+
 @app.route("/ping")
 def ping():
     return "pong"
+
 
 @app.route("/status")
 def stat():
@@ -223,40 +227,58 @@ def stat():
         "running": running
     })
 
+
 @app.route("/login")
 def login():
     return redirect(kite.login_url())
 
+
+# ⭐ FIXED CALLBACK — AUTO RETURN TO APP ⭐
 @app.route("/callback")
 def callback():
     global access_token
+
     token = request.args.get("request_token")
+
+    if not token:
+        return "No request token received"
+
     try:
         session = kite.generate_session(token, api_secret=API_SECRET)
         access_token = session["access_token"]
         kite.set_access_token(access_token)
-        return "Authentication Successful. Return to app."
+
+        # ✅ Redirect back to dashboard
+        return redirect("/")
+
     except Exception as e:
         return f"Auth Failed: {str(e)}"
+
 
 @app.route("/start", methods=["POST"])
 def start():
     global running, bot_thread
+
     with lock:
         if not access_token:
             return jsonify({"status": "Login required"})
+
         if running:
             return jsonify({"status": "Already running"})
+
         running = True
         bot_thread = threading.Thread(target=bot_loop, daemon=True)
         bot_thread.start()
+
     return jsonify({"status": "AI Trading Started"})
+
 
 @app.route("/stop", methods=["POST"])
 def stop():
     global running
     running = False
     return jsonify({"status": "Stopped"})
+
 
 # ========= LOCAL RUN =========
 
