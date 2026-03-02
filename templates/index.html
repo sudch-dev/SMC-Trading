@@ -1,94 +1,77 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AI Trading Dashboard</title>
+    <title>SMC AI ML Trading Engine</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-
     <style>
         body {
             font-family: Arial;
-            background: #111;
-            color: #fff;
+            background: #0f172a;
+            color: white;
             text-align: center;
-            padding: 20px;
         }
-
         button {
-            padding: 12px 20px;
-            margin: 8px;
-            font-size: 16px;
-            border: none;
+            padding: 10px 20px;
+            margin: 10px;
             border-radius: 8px;
+            border: none;
+            cursor: pointer;
         }
-
-        .login { background: #2196F3; color: white; }
-        .start { background: #4CAF50; color: white; }
-        .stop  { background: #f44336; color: white; }
-
-        .box {
-            background: #1e1e1e;
-            padding: 15px;
-            margin-top: 20px;
-            border-radius: 10px;
+        .login { background: #2563eb; color: white; }
+        .start { background: #16a34a; color: white; }
+        .stop { background: #dc2626; color: white; }
+        table {
+            margin: auto;
+            border-collapse: collapse;
+            width: 90%;
+        }
+        th, td {
+            border: 1px solid #334155;
+            padding: 8px;
+        }
+        th {
+            background: #1e293b;
         }
     </style>
 </head>
-
 <body>
 
-<h2>AI Intraday Trading Engine</h2>
+<h2>SMC AI ML Trading Engine</h2>
 
-<a href="/login"><button class="login">Login to Zerodha</button></a>
-<button class="start" onclick="startBot()">Start</button>
-<button class="stop" onclick="stopBot()">Stop</button>
+{% if not auth %}
+    <a href="/login">
+        <button class="login">Login to Zerodha</button>
+    </a>
+{% else %}
+    <button onclick="start()" class="start">Start Trading</button>
+    <button onclick="stop()" class="stop">Stop Trading</button>
+{% endif %}
 
-<div class="box">
-    <h3>Status</h3>
-    <div id="status">Loading...</div>
-</div>
-
-<div class="box">
-    <h3>Intraday Positions</h3>
-    <div id="positions">None</div>
-</div>
+<h3>Live Positions</h3>
+<table>
+    <tr>
+        <th>Symbol</th>
+        <th>Qty</th>
+        <th>Avg Price</th>
+        <th>PnL</th>
+    </tr>
+    {% for p in positions %}
+    <tr>
+        <td>{{p.tradingsymbol}}</td>
+        <td>{{p.quantity}}</td>
+        <td>{{p.average_price}}</td>
+        <td>{{p.pnl}}</td>
+    </tr>
+    {% endfor %}
+</table>
 
 <script>
-
-function startBot() {
-    fetch("/start", {method: "POST"})
+function start(){
+    fetch("/start").then(res => res.text()).then(data => alert(data));
 }
-
-function stopBot() {
-    fetch("/stop", {method: "POST"})
+function stop(){
+    fetch("/stop").then(res => res.text()).then(data => alert(data));
 }
-
-function updateStatus() {
-    fetch("/status")
-        .then(r => r.json())
-        .then(data => {
-
-            document.getElementById("status").innerHTML =
-                `Msg: ${data.status.msg}<br>
-                 Last: ${data.status.last}<br>
-                 P&L: ₹${data.status.pnl}<br>
-                 Funds: ₹${data.status.funds}<br>
-                 Running: ${data.running}<br>
-                 Auth: ${data.auth_active}`;
-
-            const pos = data.intraday_positions;
-
-            document.getElementById("positions").innerHTML =
-                pos.length
-                ? pos.map(p =>
-                    `${p.symbol} | Qty: ${p.qty} | Avg: ₹${p.avg_price} | PnL: ₹${p.pnl}`
-                  ).join("<br>")
-                : "No intraday positions";
-        });
-}
-
-setInterval(updateStatus, 3000);
-updateStatus();
-
 </script>
 
 </body>
