@@ -1,122 +1,93 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Trading Engine</title>
+    <title>AI Trading Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
 
-<style>
-body {
-    font-family: Arial, sans-serif;
-    background: #0f172a;
-    color: #e5e7eb;
-    margin: 0;
-    text-align: center;
-}
+    <style>
+        body {
+            font-family: Arial;
+            background: #111;
+            color: #fff;
+            text-align: center;
+            padding: 20px;
+        }
 
-.container {
-    max-width: 420px;
-    margin: auto;
-    padding: 20px;
-}
+        button {
+            padding: 12px 20px;
+            margin: 8px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+        }
 
-.card {
-    background: #1e293b;
-    padding: 20px;
-    border-radius: 14px;
-    margin-top: 20px;
-    box-shadow: 0 0 15px rgba(0,0,0,0.4);
-}
+        .login { background: #2196F3; color: white; }
+        .start { background: #4CAF50; color: white; }
+        .stop  { background: #f44336; color: white; }
 
-h1 {
-    font-size: 22px;
-    margin-bottom: 10px;
-}
-
-button {
-    width: 100%;
-    padding: 14px;
-    margin-top: 12px;
-    border: none;
-    border-radius: 10px;
-    font-size: 16px;
-    cursor: pointer;
-}
-
-.login { background: #3b82f6; color: white; }
-.start { background: #22c55e; color: white; }
-.refresh { background: #f59e0b; color: black; }
-
-.status-box {
-    text-align: left;
-    margin-top: 15px;
-    font-size: 15px;
-    line-height: 1.7;
-}
-</style>
+        .box {
+            background: #1e1e1e;
+            padding: 15px;
+            margin-top: 20px;
+            border-radius: 10px;
+        }
+    </style>
 </head>
 
 <body>
 
-<div class="container">
+<h2>AI Intraday Trading Engine</h2>
 
-    <h1>AI Trading Engine</h1>
+<a href="/login"><button class="login">Login to Zerodha</button></a>
+<button class="start" onclick="startBot()">Start</button>
+<button class="stop" onclick="stopBot()">Stop</button>
 
-    <div class="card">
+<div class="box">
+    <h3>Status</h3>
+    <div id="status">Loading...</div>
+</div>
 
-        <button class="login" onclick="login()">
-            🔐 Login Zerodha
-        </button>
-
-        <button class="start" onclick="startBot()">
-            ▶️ Start Trading
-        </button>
-
-        <button class="refresh" onclick="getStatus()">
-            🔄 Refresh Status
-        </button>
-
-        <div class="status-box" id="status">
-            Loading status...
-        </div>
-
-    </div>
-
+<div class="box">
+    <h3>Intraday Positions</h3>
+    <div id="positions">None</div>
 </div>
 
 <script>
 
-const base = window.location.origin;
-
-function login() {
-    window.location.href = base + "/login";
+function startBot() {
+    fetch("/start", {method: "POST"})
 }
 
-async function startBot() {
-    const res = await fetch(base + "/start", { method: "POST" });
-    const data = await res.json();
-    alert(data.status);
-    getStatus();
+function stopBot() {
+    fetch("/stop", {method: "POST"})
 }
 
-async function getStatus() {
-    const res = await fetch(base + "/status");
-    const data = await res.json();
+function updateStatus() {
+    fetch("/status")
+        .then(r => r.json())
+        .then(data => {
 
-    const s = data.status;
+            document.getElementById("status").innerHTML =
+                `Msg: ${data.status.msg}<br>
+                 Last: ${data.status.last}<br>
+                 P&L: ₹${data.status.pnl}<br>
+                 Funds: ₹${data.status.funds}<br>
+                 Running: ${data.running}<br>
+                 Auth: ${data.auth_active}`;
 
-    document.getElementById("status").innerHTML = `
-        <b>Message:</b> ${s.msg}<br>
-        <b>Last Update:</b> ${s.last}<br>
-        <b>P&L:</b> ₹ ${s.pnl}<br>
-        <b>Funds:</b> ₹ ${s.funds}<br>
-        <b>Authenticated:</b> ${data.auth_active ? "YES" : "NO"}
-    `;
+            const pos = data.intraday_positions;
+
+            document.getElementById("positions").innerHTML =
+                pos.length
+                ? pos.map(p =>
+                    `${p.symbol} | Qty: ${p.qty} | Avg: ₹${p.avg_price} | PnL: ₹${p.pnl}`
+                  ).join("<br>")
+                : "No intraday positions";
+        });
 }
 
-// Auto-refresh every 10 sec
-setInterval(getStatus, 10000);
-getStatus();
+setInterval(updateStatus, 3000);
+updateStatus();
 
 </script>
 
