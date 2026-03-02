@@ -4,7 +4,7 @@ import threading
 import statistics
 import requests
 
-from flask import Flask, jsonify, redirect, request
+from flask import Flask, jsonify, redirect, request, render_template
 from datetime import datetime, time as dt_time
 from pytz import timezone
 from kiteconnect import KiteConnect
@@ -33,6 +33,8 @@ MARGIN_PER_STOCK = MAX_TOTAL_MARGIN // len(SCRIPTS)
 # ========= GLOBAL STATE =========
 
 running = False
+bot_thread = None
+lock = threading.Lock()
 
 status = {
     "msg": "Idle",
@@ -43,21 +45,17 @@ status = {
 
 portfolio = {s: {"prices": [], "entry": None} for s in SCRIPTS}
 
-# ========= AI / ML & ADVANCED STATS =========
+# ========= AI / STATS =========
 
 def get_z_score(prices):
-    """Calculates Z-Score to identify overextended sentiment"""
     if len(prices) < 30:
         return 0
-
     mean = statistics.mean(prices[-30:])
     stdev = statistics.stdev(prices[-30:])
-
     return (prices[-1] - mean) / stdev if stdev > 0 else 0
 
 
 def ml_logic_gate(prices):
-    """Simulated decision tree using momentum + volatility"""
     if len(prices) < 20:
         return 0
 
@@ -66,14 +64,13 @@ def ml_logic_gate(prices):
     ema = statistics.mean(prices[-20:])
 
     if prices[-1] > ema and roc > 0.12 and vol > 0.03:
-        return 1  # Buy
+        return 1
     elif prices[-1] < ema and roc < -0.12 and vol > 0.03:
-        return -1  # Short
+        return -1
 
     return 0
 
-
-# ========= TRADING BOT CORE =========
+# ========= TRADING BOT =========
 
 def bot_loop():
     global running
@@ -82,13 +79,13 @@ def bot_loop():
         try:
             now = datetime.now(IST)
 
-            # Trade only during market hours
+            # Market hours
             if not (dt_time(9, 15) <= now.time() <= dt_time(15, 20)):
                 status["msg"] = "Market Closed"
                 time.sleep(30)
                 continue
 
-            # Get funds
+            # Fetch funds
             margins = kite.margins()
             status["funds"] = margins.get("equity", {}) \
                                      .get("available", {}) \
@@ -113,7 +110,7 @@ def bot_loop():
                 if len(data["prices"]) > 60:
                     data["prices"].pop(0)
 
-                # ===== Manage active trade =====
+                # ===== Manage open position =====
                 if data["entry"]:
                     trade = data["entry"]
 
@@ -161,7 +158,6 @@ def bot_loop():
 
                     if side:
                         qty = int(MARGIN_PER_STOCK / price)
-
                         if qty >= 1:
                             kite.place_order(
                                 variety=kite.VARIETY_REGULAR,
@@ -192,61 +188,6 @@ def bot_loop():
 
         time.sleep(10)
 
-
-# ========= FLASK ROUTES =========
-
-@app.route("/")
-def home():
-    return "AI Trading Engine Operational"
-
-
-@app.route("/ping")
-def ping():
-    return "pong"
-
-
-@app.route("/status")
-def stat():
-    return jsonify({
-        "status": status,
-        "auth_active": bool(access_token)
-    })
-
-
-@app.route("/login")
-def login():
-    return redirect(kite.login_url())
-
-
-@app.route("/callback")
-def callback():
-    global access_token
-
-    token = request.args.get("request_token")
-
-    try:
-        session = kite.generate_session(token, api_secret=API_SECRET)
-        access_token = session["access_token"]
-        kite.set_access_token(access_token)
-
-        return "Authentication Successful"
-
-    except:
-        return "Auth Failed"
-
-
-@app.route("/start", methods=["POST"])
-def start():
-    global running
-
-    if access_token and not running:
-        running = True
-        threading.Thread(target=bot_loop, daemon=True).start()
-        return jsonify({"status": "AI Logic Started"})
-
-    return jsonify({"status": "Auth required or already running"})
-
-
 # ========= KEEP ALIVE =========
 
 def self_keepalive():
@@ -258,16 +199,66 @@ def self_keepalive():
             )
         except:
             pass
-
         time.sleep(240)
 
-
-# ========= MAIN =========
-
-if __name__ == "__main__":
+# Start keep-alive thread safely on Render
+if os.environ.get("RENDER"):
     threading.Thread(target=self_keepalive, daemon=True).start()
 
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
-    )
+# ========= ROUTES =========
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+@app.route("/ping")
+def ping():
+    return "pong"
+
+@app.route("/status")
+def stat():
+    return jsonify({
+        "status": status,
+        "auth_active": bool(access_token),
+        "running": running
+    })
+
+@app.route("/login")
+def login():
+    return redirect(kite.login_url())
+
+@app.route("/callback")
+def callback():
+    global access_token
+    token = request.args.get("request_token")
+    try:
+        session = kite.generate_session(token, api_secret=API_SECRET)
+        access_token = session["access_token"]
+        kite.set_access_token(access_token)
+        return "Authentication Successful. Return to app."
+    except Exception as e:
+        return f"Auth Failed: {str(e)}"
+
+@app.route("/start", methods=["POST"])
+def start():
+    global running, bot_thread
+    with lock:
+        if not access_token:
+            return jsonify({"status": "Login required"})
+        if running:
+            return jsonify({"status": "Already running"})
+        running = True
+        bot_thread = threading.Thread(target=bot_loop, daemon=True)
+        bot_thread.start()
+    return jsonify({"status": "AI Trading Started"})
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    global running
+    running = False
+    return jsonify({"status": "Stopped"})
+
+# ========= LOCAL RUN =========
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
