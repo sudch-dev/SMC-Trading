@@ -1,4 +1,4 @@
-import os, time, threading, statistics
+import os, time, threading, statistics, requests
 from flask import Flask, render_template, jsonify, redirect, request
 from datetime import datetime, time as dt_time
 from pytz import timezone
@@ -47,49 +47,53 @@ def bot_loop():
         try:
             now = datetime.now(IST)
             # Market check
-            if not (dt_time(9, 25) <= now.time() <= dt_time(15, 20)):
+            if not (dt_time(9, 15) <= now.time() <= dt_time(15, 30)):
                 status["msg"] = "Market Closed"
                 time.sleep(30); continue
 
-            # 1. Update Global Funds & P&L
+            # 1. Update Global Funds (Safely navigation nested dict)
             margins = kite.margins()
-            status["funds"] = margins["equity"]["available"]["opening_balance"]
+            status["funds"] = margins.get("equity", {}).get("available", {}).get("live_balance", 0)
             
+            # 2. Update LTP and Prices
             query = [f"{EXCHANGE}:{s}" for s in SCRIPTS]
             quotes = kite.ltp(query)
             total_pnl = 0
 
             for symbol in SCRIPTS:
                 full_sym = f"{EXCHANGE}:{symbol}"
+                
+                # Check if symbol exists in response to avoid fetch errors
+                if full_sym not in quotes: continue
+                
                 price = quotes[full_sym]["last_price"]
                 data = portfolio[symbol]
                 data["prices"].append(price)
                 if len(data["prices"]) > 50: data["prices"].pop(0)
 
-                # 2. Manage Position
+                # 3. Manage Position
                 if data["entry"]:
                     trade = data["entry"]
-                    # Calculate Unrealized P&L
                     pnl = (price - trade["price"]) * trade["qty"]
                     total_pnl += pnl
 
-                    # Exit Logic (SL 0.5% / TP 1.0%)
                     if price <= trade["sl"] or price >= trade["tp"]:
                         kite.place_order(variety=kite.VARIETY_REGULAR, exchange=EXCHANGE, tradingsymbol=symbol,
                                          transaction_type=kite.TRANSACTION_TYPE_SELL, quantity=trade["qty"],
                                          product=kite.PRODUCT_MIS, order_type=kite.ORDER_TYPE_MARKET)
                         data["entry"] = None
                 
-                # 3. Entry Logic (EMA Pullback)
+                # 4. Entry Logic (EMA Pullback)
                 elif len(data["prices"]) >= 20:
                     ema = statistics.mean(data["prices"][-20:])
                     if price > ema and price <= ema * 1.001:
                         qty = int(MARGIN_PER_STOCK / price)
+                        if qty < 1: continue
+                        
                         order_id = kite.place_order(variety=kite.VARIETY_REGULAR, exchange=EXCHANGE, tradingsymbol=symbol,
-                                                    transaction_type=kite.TRANSACTION_TYPE_BUY, quantity=max(1, qty),
+                                                    transaction_type=kite.TRANSACTION_TYPE_BUY, quantity=qty,
                                                     product=kite.PRODUCT_MIS, order_type=kite.ORDER_TYPE_MARKET)
                         
-                        # Fetch Exchange Order ID
                         order_history = kite.order_history(order_id)
                         exchange_id = order_history[-1].get("exchange_order_id", "PENDING")
                         
@@ -99,15 +103,18 @@ def bot_loop():
                         }
 
             status["pnl"] = round(total_pnl, 2)
-            status["msg"] = "Professional Loop Active"
+            status["msg"] = "Active"
             status["last"] = now.strftime("%H:%M:%S")
 
-        except Exception as e: status["msg"] = f"Err: {str(e)[:20]}"
+        except Exception as e: status["msg"] = f"Err: {str(e)[:30]}"
         time.sleep(10)
 
 # ========= API ROUTES =========
 @app.route("/")
 def home(): return render_template("index.html")
+
+@app.route("/ping")
+def ping(): return "pong"
 
 @app.route("/status")
 def stat():
@@ -125,5 +132,17 @@ def start():
         threading.Thread(target=bot_loop, daemon=True).start()
     return jsonify({"status": "started"})
 
+# ========= KEEP ALIVE =========
+def self_keepalive():
+    """Prevents Render from sleeping."""
+    while True:
+        try:
+            # Pings the /ping route specifically
+            requests.get("https://coin-4k37.onrender.com", timeout=10)
+        except: pass
+        time.sleep(240)
+
 if __name__ == "__main__":
+    # Start keepalive before running the app
+    threading.Thread(target=self_keepalive, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
