@@ -70,7 +70,6 @@ def ml_logic_gate(prices):
 
     return 0
 
-
 # ========= TRADING BOT =========
 
 def bot_loop():
@@ -80,7 +79,6 @@ def bot_loop():
         try:
             now = datetime.now(IST)
 
-            # Trade only during market hours
             if not (dt_time(9, 15) <= now.time() <= dt_time(15, 20)):
                 status["msg"] = "Market Closed"
                 time.sleep(30)
@@ -109,7 +107,6 @@ def bot_loop():
                 if len(data["prices"]) > 60:
                     data["prices"].pop(0)
 
-                # ===== Manage open trade =====
                 if data["entry"]:
                     trade = data["entry"]
 
@@ -136,7 +133,6 @@ def bot_loop():
                         )
                         data["entry"] = None
 
-                # ===== Entry Logic =====
                 elif len(data["prices"]) >= 30:
 
                     z = get_z_score(data["prices"])
@@ -187,8 +183,7 @@ def bot_loop():
 
         time.sleep(10)
 
-
-# ========= KEEP ALIVE (as requested) =========
+# ========= KEEP ALIVE =========
 
 def self_keepalive():
     while True:
@@ -201,11 +196,8 @@ def self_keepalive():
             pass
         time.sleep(240)
 
-
-# Start keep-alive thread on Render
 if os.environ.get("RENDER"):
     threading.Thread(target=self_keepalive, daemon=True).start()
-
 
 # ========= ROUTES =========
 
@@ -221,10 +213,26 @@ def ping():
 
 @app.route("/status")
 def stat():
+    intraday_positions = []
+
+    try:
+        pos = kite.positions()
+        for p in pos["day"]:
+            if p["product"] == "MIS" and p["quantity"] != 0:
+                intraday_positions.append({
+                    "symbol": p["tradingsymbol"],
+                    "qty": p["quantity"],
+                    "avg_price": p["average_price"],
+                    "pnl": p["pnl"]
+                })
+    except:
+        pass
+
     return jsonify({
         "status": status,
         "auth_active": bool(access_token),
-        "running": running
+        "running": running,
+        "intraday_positions": intraday_positions
     })
 
 
@@ -233,11 +241,9 @@ def login():
     return redirect(kite.login_url())
 
 
-# ⭐ FIXED CALLBACK — AUTO RETURN TO APP ⭐
 @app.route("/callback")
 def callback():
     global access_token
-
     token = request.args.get("request_token")
 
     if not token:
@@ -247,10 +253,7 @@ def callback():
         session = kite.generate_session(token, api_secret=API_SECRET)
         access_token = session["access_token"]
         kite.set_access_token(access_token)
-
-        # ✅ Redirect back to dashboard
         return redirect("/")
-
     except Exception as e:
         return f"Auth Failed: {str(e)}"
 
@@ -262,7 +265,6 @@ def start():
     with lock:
         if not access_token:
             return jsonify({"status": "Login required"})
-
         if running:
             return jsonify({"status": "Already running"})
 
@@ -279,8 +281,6 @@ def stop():
     running = False
     return jsonify({"status": "Stopped"})
 
-
-# ========= LOCAL RUN =========
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
