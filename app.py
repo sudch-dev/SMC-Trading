@@ -3,248 +3,287 @@ import time
 import threading
 import requests
 import numpy as np
-import pandas as pd
-import joblib
-from flask import Flask, jsonify
+
+from datetime import datetime
+from flask import Flask, redirect, request, jsonify, render_template
+
 from kiteconnect import KiteConnect
-from datetime import datetime, timedelta
+from sklearn.linear_model import LogisticRegression
 
 # ================= CONFIG =================
 
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET")
-access_token = os.environ.get("access_token")
+ACCESS_TOKEN = os.environ.get("access_token")
 
 CAPITAL = 5000
-MAX_TRADES = 2
-RISK_PER_DAY = 150
-PROB_THRESHOLD = 0.72
-INTERVAL = "5minute"
-
-RENDER_URL = "https://smc-trading.onrender.com"
-
-# ================= INIT =================
+SCAN_INTERVAL = 300
+AUTO_TRADE = True
 
 app = Flask(__name__)
 
 kite = KiteConnect(api_key=API_KEY)
-kite.set_access_token(access_token)
 
-model = joblib.load("model.pkl")
+auth_active = False
+if ACCESS_TOKEN:
+    kite.set_access_token(ACCESS_TOKEN)
+    auth_active = True
 
-running = True
-daily_pnl = 0
-open_positions = {}
-
-# ================= NIFTY 50 =================
-
-NIFTY50 = [
-"RELIANCE","TCS","HDFCBANK","ICICIBANK","INFY","HINDUNILVR",
-"ITC","SBIN","BHARTIARTL","KOTAKBANK","LT","AXISBANK",
-"ASIANPAINT","MARUTI","SUNPHARMA","ULTRACEMCO","NTPC",
-"TITAN","POWERGRID","ONGC","BAJFINANCE","BAJAJFINSV",
-"WIPRO","NESTLEIND","ADANIENT","ADANIPORTS","HCLTECH",
-"TATASTEEL","JSWSTEEL","INDUSINDBK","COALINDIA","GRASIM",
-"TECHM","M&M","DRREDDY","DIVISLAB","HEROMOTOCO",
-"CIPLA","EICHERMOT","APOLLOHOSP","BRITANNIA","UPL",
-"BPCL","TATAMOTORS","SBILIFE","HDFCLIFE","ICICIPRULI",
-"SHREECEM","BAJAJ-AUTO"
-]
-
-# ================= FEATURE ENGINE =================
-
-def build_features(df):
-    df["ret1"] = df["close"].pct_change()
-    df["ret3"] = df["close"].pct_change(3)
-    df["ret6"] = df["close"].pct_change(6)
-
-    df["ema9"] = df["close"].ewm(span=9).mean()
-    df["ema21"] = df["close"].ewm(span=21).mean()
-    df["ema_diff"] = df["ema9"] - df["ema21"]
-
-    df["vol_ratio"] = df["volume"] / df["volume"].rolling(20).mean()
-
-    df["tr"] = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(
-            abs(df["high"] - df["close"].shift()),
-            abs(df["low"] - df["close"].shift())
-        )
-    )
-    df["atr"] = df["tr"].rolling(14).mean()
-
-    latest = df.iloc[-1]
-
-    features = [
-        latest["ret1"],
-        latest["ret3"],
-        latest["ret6"],
-        latest["ema_diff"],
-        latest["vol_ratio"],
-        latest["atr"]
-    ]
-
-    return np.nan_to_num(features), latest["atr"], latest["close"]
-
-# ================= TRADE EXECUTION =================
-
-def enter_trade(symbol, direction, price, atr):
-    global open_positions
-
-    capital_per_trade = CAPITAL / MAX_TRADES
-    qty = int(capital_per_trade / price)
-
-    if qty <= 0:
-        return
-
-    if direction == "BUY":
-        sl = price - 0.6 * atr
-        tp = price + 1.2 * atr
-        transaction_type = kite.TRANSACTION_TYPE_BUY
-    else:
-        sl = price + 0.6 * atr
-        tp = price - 1.2 * atr
-        transaction_type = kite.TRANSACTION_TYPE_SELL
-
-    kite.place_order(
-        variety=kite.VARIETY_REGULAR,
-        exchange=kite.EXCHANGE_NSE,
-        tradingsymbol=symbol,
-        transaction_type=transaction_type,
-        quantity=qty,
-        order_type=kite.ORDER_TYPE_MARKET,
-        product=kite.PRODUCT_MIS
-    )
-
-    open_positions[symbol] = {
-        "direction": direction,
-        "entry": price,
-        "qty": qty,
-        "sl": sl,
-        "tp": tp
-    }
-
-# ================= POSITION MONITOR =================
-
-def monitor_positions():
-    global daily_pnl
-
-    while running:
-        try:
-            for symbol in list(open_positions.keys()):
-                ltp = kite.ltp(f"NSE:{symbol}")[f"NSE:{symbol}"]["last_price"]
-                pos = open_positions[symbol]
-
-                if pos["direction"] == "BUY":
-                    exit_cond = ltp <= pos["sl"] or ltp >= pos["tp"]
-                    pnl = (ltp - pos["entry"]) * pos["qty"]
-                    exit_type = kite.TRANSACTION_TYPE_SELL
-                else:
-                    exit_cond = ltp >= pos["sl"] or ltp <= pos["tp"]
-                    pnl = (pos["entry"] - ltp) * pos["qty"]
-                    exit_type = kite.TRANSACTION_TYPE_BUY
-
-                if exit_cond:
-                    kite.place_order(
-                        variety=kite.VARIETY_REGULAR,
-                        exchange=kite.EXCHANGE_NSE,
-                        tradingsymbol=symbol,
-                        transaction_type=exit_type,
-                        quantity=pos["qty"],
-                        order_type=kite.ORDER_TYPE_MARKET,
-                        product=kite.PRODUCT_MIS
-                    )
-
-                    daily_pnl += pnl
-                    del open_positions[symbol]
-
-        except:
-            pass
-
-        time.sleep(5)
-
-# ================= SCREENER =================
-
-def screener():
-    global running
-
-    while running:
-        if daily_pnl <= -RISK_PER_DAY:
-            break
-
-        if len(open_positions) >= MAX_TRADES:
-            time.sleep(60)
-            continue
-
-        try:
-            for symbol in NIFTY50:
-                if symbol in open_positions:
-                    continue
-
-                token = kite.ltp(f"NSE:{symbol}")[f"NSE:{symbol}"]["instrument_token"]
-
-                to_date = datetime.now()
-                from_date = to_date - timedelta(days=5)
-
-                data = kite.historical_data(
-                    token,
-                    from_date,
-                    to_date,
-                    INTERVAL
-                )
-
-                df = pd.DataFrame(data)
-                if len(df) < 30:
-                    continue
-
-                features, atr, price = build_features(df)
-                prob = model.predict_proba([features])[0][1]
-
-                if prob > PROB_THRESHOLD:
-                    enter_trade(symbol, "BUY", price, atr)
-
-                elif (1 - prob) > PROB_THRESHOLD:
-                    enter_trade(symbol, "SELL", price, atr)
-
-                if len(open_positions) >= MAX_TRADES:
-                    break
-
-        except:
-            pass
-
-        time.sleep(300)
 
 # ================= KEEP ALIVE =================
 
 @app.route("/ping")
 def ping():
-    return "pong", 200
+    return "pong"
+
 
 def self_keepalive():
     while True:
         try:
-            requests.get(f"{RENDER_URL}/ping", timeout=10)
+            requests.get(
+                "https://smc-trading.onrender.com/ping",
+                timeout=10
+            )
         except:
             pass
         time.sleep(240)
 
-# ================= STATUS =================
 
-@app.route("/status")
-def status():
-    return jsonify({
-        "running": running,
-        "daily_pnl": daily_pnl,
-        "open_positions": open_positions
-    })
-
-# ================= START THREADS =================
-
-threading.Thread(target=monitor_positions, daemon=True).start()
-threading.Thread(target=screener, daemon=True).start()
 threading.Thread(target=self_keepalive, daemon=True).start()
 
-# ================= RUN =================
+
+# ================= NIFTY 50 (sample liquid set) =================
+
+NIFTY50 = [
+    "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK",
+    "SBIN","LT","ITC","KOTAKBANK","AXISBANK",
+    "BAJFINANCE","MARUTI","TITAN","SUNPHARMA"
+]
+
+
+# ================= ML MODEL =================
+
+model = LogisticRegression()
+
+def extract_features(symbol):
+    """Create ML features from price + volume"""
+
+    try:
+        data = kite.historical_data(
+            instrument_token=kite.ltp(f"NSE:{symbol}")[f"NSE:{symbol}"]["instrument_token"],
+            from_date=datetime.now().replace(hour=9, minute=15),
+            to_date=datetime.now(),
+            interval="5minute"
+        )
+
+        if len(data) < 15:
+            return None
+
+        closes = np.array([c["close"] for c in data])
+        volumes = np.array([c["volume"] for c in data])
+
+        ret1 = (closes[-1] - closes[-2]) / closes[-2]
+        ret5 = (closes[-1] - closes[-6]) / closes[-6]
+
+        vol_ratio = volumes[-1] / np.mean(volumes[-10:])
+
+        trend = closes[-1] - np.mean(closes[-10:])
+
+        return [ret1, ret5, vol_ratio, trend]
+
+    except:
+        return None
+
+
+def train_dummy_model():
+    """Synthetic training so model exists (online learning)"""
+
+    X = []
+    y = []
+
+    for _ in range(200):
+        r1 = np.random.normal(0, 0.002)
+        r5 = np.random.normal(0, 0.005)
+        vr = np.random.uniform(0.5, 2)
+        tr = np.random.normal(0, 1)
+
+        score = r1 + r5 + (vr - 1) * 0.3 + tr * 0.01
+
+        X.append([r1, r5, vr, tr])
+        y.append(1 if score > 0 else 0)
+
+    model.fit(X, y)
+
+
+train_dummy_model()
+
+
+# ================= SIGNAL =================
+
+def ai_signal(symbol):
+
+    features = extract_features(symbol)
+    if features is None:
+        return False
+
+    prob = model.predict_proba([features])[0][1]
+
+    # confidence threshold
+    return prob > 0.65
+
+
+# ================= ORDER ENGINE =================
+
+def get_ltp(symbol):
+    try:
+        return kite.ltp(f"NSE:{symbol}")[f"NSE:{symbol}"]["last_price"]
+    except:
+        return None
+
+
+def place_trade(symbol):
+
+    price = get_ltp(symbol)
+    if not price:
+        return
+
+    qty = max(1, int(CAPITAL / price))
+
+    try:
+        kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=symbol,
+            transaction_type=kite.TRANSACTION_TYPE_BUY,
+            quantity=qty,
+            order_type=kite.ORDER_TYPE_MARKET,
+            product=kite.PRODUCT_MIS
+        )
+
+        print("TRADE:", symbol, qty)
+
+    except Exception as e:
+        print("Order error:", e)
+
+
+def has_position():
+    try:
+        return any(p["quantity"] != 0 for p in kite.positions()["net"])
+    except:
+        return False
+
+
+def square_off_all():
+    try:
+        for p in kite.positions()["net"]:
+            if p["quantity"] != 0:
+                kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange=p["exchange"],
+                    tradingsymbol=p["tradingsymbol"],
+                    transaction_type=kite.TRANSACTION_TYPE_SELL
+                    if p["quantity"] > 0 else kite.TRANSACTION_TYPE_BUY,
+                    quantity=abs(p["quantity"]),
+                    order_type=kite.ORDER_TYPE_MARKET,
+                    product=kite.PRODUCT_MIS
+                )
+    except:
+        pass
+
+
+# ================= AUTO TRADING LOOP =================
+
+def trading_engine():
+
+    while True:
+
+        if not AUTO_TRADE or not auth_active:
+            time.sleep(30)
+            continue
+
+        now = datetime.now().time()
+
+        if now < datetime.strptime("09:20", "%H:%M").time() \
+           or now > datetime.strptime("15:20", "%H:%M").time():
+
+            if now > datetime.strptime("15:20", "%H:%M").time():
+                square_off_all()
+
+            time.sleep(60)
+            continue
+
+        if has_position():
+            time.sleep(SCAN_INTERVAL)
+            continue
+
+        print("AI scanning market...")
+
+        for symbol in NIFTY50:
+
+            if ai_signal(symbol):
+                place_trade(symbol)
+                break
+
+        time.sleep(SCAN_INTERVAL)
+
+
+threading.Thread(target=trading_engine, daemon=True).start()
+
+
+# ================= ROUTES =================
+
+@app.route("/")
+def home():
+    return render_template("index.html", auth=auth_active)
+
+
+@app.route("/login")
+def login():
+    return redirect(kite.login_url())
+
+
+@app.route("/callback")
+def callback():
+    global auth_active
+
+    request_token = request.args.get("request_token")
+
+    session = kite.generate_session(
+        request_token,
+        api_secret=API_SECRET
+    )
+
+    access_token = session["access_token"]
+    kite.set_access_token(access_token)
+
+    auth_active = True
+
+    print("ACCESS TOKEN:", access_token)
+
+    return redirect("/")
+
+
+@app.route("/positions")
+def positions():
+    if not auth_active:
+        return jsonify({"error": "Not authenticated"})
+    return jsonify(kite.positions())
+
+
+@app.route("/orders")
+def orders():
+    if not auth_active:
+        return jsonify({"error": "Not authenticated"})
+    return jsonify(kite.orders())
+
+
+@app.route("/squareoff")
+def manual_squareoff():
+    square_off_all()
+    return "Squared off"
+
+
+# ================= SERVER =================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
