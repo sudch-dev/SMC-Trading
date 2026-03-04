@@ -29,19 +29,21 @@ if ACCESS_TOKEN:
     kite.set_access_token(ACCESS_TOKEN)
     auth_active = True
 
-# Global tracker for trailing SL (stores highest price for Long, lowest for Short)
+# Stores highest price for Long, lowest for Short
 trailing_tracker = {}
 
-# ================= KEEP ALIVE =================
+# ================= KEEP ALIVE (STABILIZED) =================
 
 @app.route("/ping")
 def ping():
     return "pong"
 
 def self_keepalive():
+    time.sleep(30) # Let server boot first
     while True:
         try:
-            requests.get("https://smc-trading.onrender.com", timeout=10)
+            # Ping internal port to avoid Render connection errors
+            requests.get("http://127.0.0.1", timeout=5)
         except:
             pass
         time.sleep(240)
@@ -62,7 +64,8 @@ model = LogisticRegression()
 
 def extract_features(symbol):
     try:
-        inst_token = kite.ltp(f"NSE:{symbol}")[f"NSE:{symbol}"]["instrument_token"]
+        ltp_info = kite.ltp(f"NSE:{symbol}")[f"NSE:{symbol}"]
+        inst_token = ltp_info["instrument_token"]
         data = kite.historical_data(
             instrument_token=inst_token,
             from_date=datetime.now().replace(hour=9, minute=15),
@@ -84,7 +87,7 @@ def extract_features(symbol):
         return None
 
 def train_dummy_model():
-    # Training for 3 classes: 0=Sell, 1=No Trade, 2=Buy
+    # 0=Sell, 1=No Trade, 2=Buy
     X, y = [], []
     for _ in range(300):
         r1, r5 = np.random.normal(0, 0.002), np.random.normal(0, 0.005)
@@ -104,7 +107,8 @@ def ai_signal(symbol):
     features = extract_features(symbol)
     if features is None: return None
     
-    probs = model.predict_proba([features])[0]
+    probs = model.predict_proba([features])[0] # Get probabilities for first sample
+    
     # probs index: 0=SELL, 1=WAIT, 2=BUY
     if probs[2] > 0.65: return "BUY"
     if probs[0] > 0.65: return "SELL"
@@ -132,7 +136,7 @@ def place_trade(symbol, side):
         trailing_tracker[symbol] = price 
         print(f"ENTRY {side}: {symbol} at {price}")
     except Exception as e:
-        print("Order error:", e)
+        print(f"Order error: {e}")
 
 def square_off_all():
     try:
@@ -145,8 +149,8 @@ def square_off_all():
                     quantity=abs(p["quantity"]), order_type=kite.ORDER_TYPE_MARKET, product=kite.PRODUCT_MIS
                 )
         trailing_tracker.clear()
-    except:
-        pass
+    except Exception as e:
+        print(f"Square-off error: {e}")
 
 # ================= TRADING ENGINE =================
 
