@@ -1,138 +1,86 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>AI Trading Engine</title>
-
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
-<style>
-body {
-    font-family: Arial, sans-serif;
-    background: #0f172a;
-    color: #e5e7eb;
-    text-align: center;
-    padding: 20px;
-}
-
-h1 {
-    color: #22c55e;
-}
-
-.card {
-    background: #1e293b;
-    padding: 18px;
-    margin: 15px auto;
-    border-radius: 12px;
-    max-width: 600px;
-}
-
-button {
-    padding: 12px 18px;
-    margin: 6px;
-    border: none;
-    border-radius: 8px;
-    font-size: 16px;
-    cursor: pointer;
-}
-
-.login { background: #2563eb; color: white; }
-.square { background: #ef4444; color: white; }
-.refresh { background: #22c55e; color: black; }
-
-pre {
-    text-align: left;
-    overflow-x: auto;
-    background: #020617;
-    padding: 10px;
-    border-radius: 8px;
-}
-</style>
+    <meta charset="UTF-8"><title>SMC Bot Control</title>
+    <script src="https://cdn.tailwindcss.com"></script>
 </head>
+<body class="bg-black text-gray-200 p-6">
+    <div class="max-w-6xl mx-auto space-y-6">
+        <!-- Header & Vital Stats -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800">
+                <p class="text-xs text-zinc-500 uppercase">Engine Status</p>
+                <h2 id="status-text" class="text-xl font-bold text-yellow-500">Connecting...</h2>
+            </div>
+            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800">
+                <p class="text-xs text-zinc-500 uppercase">Available Funds</p>
+                <h2 id="funds" class="text-xl font-bold text-green-400">₹ 0.00</h2>
+            </div>
+            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800">
+                <p class="text-xs text-zinc-500 uppercase">Orders (Traded/Total)</p>
+                <h2 id="order-ratio" class="text-xl font-bold">0 / 0</h2>
+            </div>
+            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800 text-right">
+                <button onclick="location.href='/squareoff'" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded text-sm font-bold">PANIC SQUARE OFF</button>
+            </div>
+        </div>
 
-<body>
+        <!-- Active Positions -->
+        <div class="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
+            <div class="px-6 py-4 border-b border-zinc-800 font-bold">Live Positions</div>
+            <table class="w-full text-sm text-left">
+                <thead class="bg-zinc-800 text-zinc-400">
+                    <tr>
+                        <th class="p-4">Symbol</th>
+                        <th class="p-4">Qty</th>
+                        <th class="p-4">Avg Price</th>
+                        <th class="p-4">P&L</th>
+                    </tr>
+                </thead>
+                <tbody id="pos-body"></tbody>
+            </table>
+        </div>
 
-<h1>🤖 AI Auto Trading Engine</h1>
+        <!-- Error / Log Section -->
+        <div id="error-box" class="hidden bg-red-900/20 border border-red-900 text-red-400 p-4 rounded-xl text-sm"></div>
+    </div>
 
-<div class="card">
+    <script>
+        async function updateDashboard() {
+            try {
+                const res = await fetch('/dashboard_data');
+                const data = await res.json();
+                
+                if(data.error) {
+                    document.getElementById('error-box').innerText = "System Error: " + data.error;
+                    document.getElementById('error-box').classList.remove('hidden');
+                    return;
+                }
 
-{% if not auth %}
-    <p>Not authenticated</p>
-    <a href="/login">
-        <button class="login">Login to Broker</button>
-    </a>
-{% else %}
-    <p style="color:#22c55e;">Authenticated ✔</p>
-{% endif %}
+                // Update Stats
+                document.getElementById('status-text').innerText = data.engine_running ? "RUNNING" : "IDLE";
+                document.getElementById('status-text').className = data.engine_running ? "text-xl font-bold text-green-500" : "text-xl font-bold text-gray-500";
+                document.getElementById('funds').innerText = "₹" + data.funds.toLocaleString();
+                document.getElementById('order-ratio').innerText = `${data.orders_traded} / ${data.orders_sent}`;
 
-</div>
-
-
-<div class="card">
-    <h3>Manual Controls</h3>
-
-    <button class="square" onclick="squareOff()">Square Off All</button>
-    <button class="refresh" onclick="loadAll()">Refresh Data</button>
-
-    <p id="status"></p>
-</div>
-
-
-<div class="card">
-    <h3>Open Positions</h3>
-    <pre id="positions">Loading...</pre>
-</div>
-
-
-<div class="card">
-    <h3>Order Book</h3>
-    <pre id="orders">Loading...</pre>
-</div>
-
-
-<script>
-
-async function loadPositions() {
-    try {
-        const res = await fetch("/positions");
-        const data = await res.json();
-        document.getElementById("positions").textContent =
-            JSON.stringify(data, null, 2);
-    } catch {
-        document.getElementById("positions").textContent = "Error loading positions";
-    }
-}
-
-async function loadOrders() {
-    try {
-        const res = await fetch("/orders");
-        const data = await res.json();
-        document.getElementById("orders").textContent =
-            JSON.stringify(data, null, 2);
-    } catch {
-        document.getElementById("orders").textContent = "Error loading orders";
-    }
-}
-
-async function squareOff() {
-    document.getElementById("status").innerText = "Squaring off...";
-    await fetch("/squareoff");
-    document.getElementById("status").innerText = "Done";
-    loadAll();
-}
-
-function loadAll() {
-    loadPositions();
-    loadOrders();
-}
-
-// Auto refresh every 15 seconds
-setInterval(loadAll, 15000);
-
-// Initial load
-loadAll();
-
-</script>
-
+                // Update Positions
+                const posBody = document.getElementById('pos-body');
+                posBody.innerHTML = data.positions.map(p => `
+                    <tr class="border-b border-zinc-800">
+                        <td class="p-4 font-mono">${p.tradingsymbol}</td>
+                        <td class="p-4 ${p.quantity >= 0 ? 'text-green-400' : 'text-red-400'}">${p.quantity}</td>
+                        <td class="p-4">₹${p.average_price}</td>
+                        <td class="p-4 font-bold ${p.pnl >= 0 ? 'text-green-400' : 'text-red-400'}">₹${p.pnl.toFixed(2)}</td>
+                    </tr>
+                `).join('');
+                
+                document.getElementById('error-box').classList.add('hidden');
+            } catch (e) {
+                document.getElementById('status-text').innerText = "OFFLINE";
+            }
+        }
+        setInterval(updateDashboard, 5000); // 5 second refresh
+        updateDashboard();
+    </script>
 </body>
 </html>
