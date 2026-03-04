@@ -30,21 +30,21 @@ if ACCESS_TOKEN:
 
 trailing_tracker = {}
 
-# ================= FIXED PROTOCOL & KEEP ALIVE =================
+# ================= KEEP ALIVE (STABILIZED) =================
 
 @app.route("/ping")
 def ping():
     return "pong"
 
 def self_keepalive():
-    """Uses internal loopback to avoid Render external ConnectionErrors"""
-    time.sleep(60) # Wait for server to bind
+    """Bypasses Render protocol errors by using local loopback"""
+    time.sleep(60) 
     while True:
         try:
-            # Pinging localhost:port is safer than an external URL
+            # Internal ping to keep container warm
             requests.get("http://127.0.0.1", timeout=5)
         except Exception:
-            pass # Suppress transient connection errors during boot
+            pass 
         time.sleep(240)
 
 threading.Thread(target=self_keepalive, daemon=True).start()
@@ -53,7 +53,8 @@ threading.Thread(target=self_keepalive, daemon=True).start()
 
 NIFTY50 = ["RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","SBIN","LT","ITC","KOTAKBANK","AXISBANK","BAJFINANCE","MARUTI","TITAN","SUNPHARMA"]
 
-model = LogisticRegression(multi_class='multinomial', solver='lbfgs')
+# Fixed: Removed multi_class for compatibility with scikit-learn 1.4+
+model = LogisticRegression(solver='lbfgs')
 
 def train_dummy_model():
     # 0=Sell, 1=Wait, 2=Buy
@@ -64,7 +65,7 @@ def train_dummy_model():
         score = r1 + r5 + (vr - 1) * 0.3 + tr * 0.01
         X.append([r1, r5, vr, tr])
         y.append(2 if score > 0.01 else (0 if score < -0.01 else 1))
-    model.fit(X, y)
+    model.fit(np.array(X), np.array(y))
 
 train_dummy_model()
 
@@ -72,7 +73,6 @@ train_dummy_model()
 
 def ai_signal(symbol):
     try:
-        # Extract features (reused from your existing logic)
         ltp_data = kite.ltp(f"NSE:{symbol}")[f"NSE:{symbol}"]
         data = kite.historical_data(ltp_data["instrument_token"], datetime.now().replace(hour=9, minute=15), datetime.now(), "5minute")
         if len(data) < 15: return None
@@ -81,7 +81,7 @@ def ai_signal(symbol):
         volumes = np.array([c["volume"] for c in data])
         feat = [(closes[-1]-closes[-2])/closes[-2], (closes[-1]-closes[-6])/closes[-6], volumes[-1]/np.mean(volumes[-10:]), closes[-1]-np.mean(closes[-10:])]
         
-        # FIXED: Index into the first row of probabilities
+        # Fixed: predict_proba returns [ [prob_sell, prob_wait, prob_buy] ]
         probs = model.predict_proba([feat])[0]
         
         if probs[2] > 0.65: return "BUY"
@@ -91,13 +91,15 @@ def ai_signal(symbol):
 
 def square_off_all():
     try:
-        for p in kite.positions()["net"]:
+        positions = kite.positions()["net"]
+        for p in positions:
             if p["quantity"] != 0:
                 side = kite.TRANSACTION_TYPE_SELL if p["quantity"] > 0 else kite.TRANSACTION_TYPE_BUY
                 kite.place_order(variety=kite.VARIETY_REGULAR, exchange=p["exchange"], tradingsymbol=p["tradingsymbol"],
                                 transaction_type=side, quantity=abs(p["quantity"]), order_type=kite.ORDER_TYPE_MARKET, product=kite.PRODUCT_MIS)
         trailing_tracker.clear()
-    except Exception as e: print(f"SQ Error: {e}")
+    except Exception as e: 
+        print(f"SQ Error: {e}")
 
 def trading_engine():
     global trailing_tracker
@@ -111,20 +113,27 @@ def trading_engine():
         
         # Position Monitoring (TP 0.2%, SL Trailing 0.5%)
         try:
-            active_pos = [p for p in kite.positions()["net"] if p["quantity"] != 0]
+            positions = kite.positions()["net"]
+            active_pos = [p for p in positions if p["quantity"] != 0]
             if active_pos:
                 for pos in active_pos:
-                    sym, ltp = pos["tradingsymbol"], kite.ltp(f"NSE:{pos['tradingsymbol']}")[f"NSE:{pos['tradingsymbol']}"]["last_price"]
+                    sym = pos["tradingsymbol"]
+                    ltp = kite.ltp(f"NSE:{sym}")[f"NSE:{sym}"]["last_price"]
                     entry, qty = float(pos["average_price"]), pos["quantity"]
                     
                     if sym not in trailing_tracker: trailing_tracker[sym] = ltp
                     
                     if qty > 0: # LONG
                         trailing_tracker[sym] = max(ltp, trailing_tracker[sym])
-                        if ltp >= entry * 1.002 or ltp <= trailing_tracker[sym] * 0.995: square_off_all()
+                        tp_hit = ltp >= entry * 1.002
+                        sl_hit = ltp <= trailing_tracker[sym] * 0.995
                     else: # SHORT
                         trailing_tracker[sym] = min(ltp, trailing_tracker[sym])
-                        if ltp <= entry * 0.998 or ltp >= trailing_tracker[sym] * 1.005: square_off_all()
+                        tp_hit = ltp <= entry * 0.998
+                        sl_hit = ltp >= trailing_tracker[sym] * 1.005
+
+                    if tp_hit or sl_hit:
+                        square_off_all()
                 time.sleep(SCAN_INTERVAL); continue
         except: pass
 
@@ -142,19 +151,28 @@ def trading_engine():
 
 threading.Thread(target=trading_engine, daemon=True).start()
 
+# ================= ROUTES =================
+
 @app.route("/")
-def home(): return render_template("index.html", auth=auth_active)
+def home(): 
+    return render_template("index.html", auth=auth_active)
 
 @app.route("/login")
-def login(): return redirect(kite.login_url())
+def login(): 
+    return redirect(kite.login_url())
 
 @app.route("/callback")
 def callback():
     global auth_active
-    session = kite.generate_session(request.args.get("request_token"), api_secret=API_SECRET)
+    request_token = request.args.get("request_token")
+    session = kite.generate_session(request_token, api_secret=API_SECRET)
     kite.set_access_token(session["access_token"])
     auth_active = True
     return redirect("/")
+
+@app.route("/positions")
+def get_positions():
+    return jsonify(kite.positions()) if auth_active else jsonify({"error": "Auth failed"})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
