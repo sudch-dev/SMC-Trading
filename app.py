@@ -6,9 +6,8 @@ from kiteconnect import KiteConnect
 # ================= CONFIG =================
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET")
-# Vital for Render Binding
 PORT = int(os.environ.get("PORT", 10000))
-# URL of your hosted app to ping itself
+# Set this in Render Env Vars to your actual URL (e.g., https://bot.onrender.com)
 RENDER_URL = os.environ.get("RENDER_URL", f"http://0.0.0.0:{PORT}")
 
 trade_config = {
@@ -24,15 +23,14 @@ kite = KiteConnect(api_key=API_KEY)
 auth_active = False
 last_error = None
 
-# ================= KEEP ALIVE PROTOCOL =================
+# ================= KEEP ALIVE =================
 def self_keepalive():
-    """Pings the /ping route every 4 mins to prevent Render sleep"""
-    time.sleep(30) # Initial boot delay
+    """Pings the app every 4 mins to prevent Render sleep"""
+    time.sleep(30)
     while True:
         try:
             requests.get(f"{RENDER_URL}/ping", timeout=10)
-        except Exception as e:
-            print(f"Keep-alive skip: {e}")
+        except: pass
         time.sleep(240)
 
 threading.Thread(target=self_keepalive, daemon=True).start()
@@ -43,10 +41,10 @@ def get_atm_strike():
     return int(round(ltp / 50) * 50)
 
 def get_expiry_str():
+    """Kite Weekly Format: YYMDD (Month: 1-9, O, N, D)"""
     today = datetime.now()
-    # Nifty Weekly Expiry (Tuesday)
-    days_until = (1 - today.weekday() + 7) % 7
-    expiry = today + timedelta(days=days_until)
+    days_until_tue = (1 - today.weekday() + 7) % 7
+    expiry = today + timedelta(days=days_until_tue)
     y = str(expiry.year)[2:]
     m = str(expiry.month)
     if m == "10": m = "O"
@@ -86,10 +84,9 @@ threading.Thread(target=trade_monitor, daemon=True).start()
 
 # ================= ROUTES =================
 @app.route("/")
-def home(): return render_template("index.html", auth=auth_active, config=trade_config)
-
-@app.route("/ping")
-def ping(): return "pong"
+def home():
+    # Enforce Protocol: Show Login if not auth_active
+    return render_template("index.html", auth=auth_active, config=trade_config)
 
 @app.route("/login")
 def login(): return redirect(kite.login_url())
@@ -101,8 +98,8 @@ def callback():
         session = kite.generate_session(request.args.get("request_token"), api_secret=API_SECRET)
         kite.set_access_token(session["access_token"])
         auth_active = True
-        return redirect("/")
-    except: return "Auth Failed"
+        return redirect("/") # Redirect back to Dashboard
+    except: return "Authentication Failed"
 
 @app.route("/update_trade", methods=["POST"])
 def update_trade():
@@ -120,6 +117,9 @@ def status():
     pos = kite.positions()["net"] if auth_active else []
     return jsonify({"positions": pos, "error": last_error, "config": trade_config})
 
+@app.route("/ping")
+def ping(): return "pong"
+
 def square_off_all():
     for p in kite.positions()["net"]:
         if p["quantity"] != 0:
@@ -128,5 +128,4 @@ def square_off_all():
                              transaction_type=side, quantity=abs(p["quantity"]), order_type=kite.ORDER_TYPE_MARKET, product=kite.PRODUCT_MIS)
 
 if __name__ == "__main__":
-    # Required for Render Port Binding
     app.run(host="0.0.0.0", port=PORT)
