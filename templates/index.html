@@ -1,86 +1,53 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8"><title>SMC Bot Control</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>ATM Option Bot</title>
+    <script src="https://code.jquery.com"></script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #f4f4f9; }
+        .card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        input { padding: 8px; width: 60px; margin-right: 10px; }
+        button { padding: 8px 15px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+    </style>
 </head>
-<body class="bg-black text-gray-200 p-6">
-    <div class="max-w-6xl mx-auto space-y-6">
-        <!-- Header & Vital Stats -->
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800">
-                <p class="text-xs text-zinc-500 uppercase">Engine Status</p>
-                <h2 id="status-text" class="text-xl font-bold text-yellow-500">Connecting...</h2>
-            </div>
-            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800">
-                <p class="text-xs text-zinc-500 uppercase">Available Funds</p>
-                <h2 id="funds" class="text-xl font-bold text-green-400">₹ 0.00</h2>
-            </div>
-            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800">
-                <p class="text-xs text-zinc-500 uppercase">Orders (Traded/Total)</p>
-                <h2 id="order-ratio" class="text-xl font-bold">0 / 0</h2>
-            </div>
-            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800 text-right">
-                <button onclick="location.href='/squareoff'" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded text-sm font-bold">PANIC SQUARE OFF</button>
-            </div>
-        </div>
+<body>
+    <h1>Kite ATM Option Bot</h1>
+    
+    <div class="card">
+        <h3>Authentication</h3>
+        {% if not auth %}<a href="/login"><button>Login to Zerodha</button></a>{% else %}<span style="color:green;">● Connected</span>{% endif %}
+    </div>
 
-        <!-- Active Positions -->
-        <div class="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
-            <div class="px-6 py-4 border-b border-zinc-800 font-bold">Live Positions</div>
-            <table class="w-full text-sm text-left">
-                <thead class="bg-zinc-800 text-zinc-400">
-                    <tr>
-                        <th class="p-4">Symbol</th>
-                        <th class="p-4">Qty</th>
-                        <th class="p-4">Avg Price</th>
-                        <th class="p-4">P&L</th>
-                    </tr>
-                </thead>
-                <tbody id="pos-body"></tbody>
-            </table>
-        </div>
+    <div class="card">
+        <h3>Risk Management (TP/SL %)</h3>
+        Target: <input type="number" id="tp" value="20"> 
+        Stoploss: <input type="number" id="sl" value="10">
+        <button onclick="updateRisk()">Update Limits</button>
+    </div>
 
-        <!-- Error / Log Section -->
-        <div id="error-box" class="hidden bg-red-900/20 border border-red-900 text-red-400 p-4 rounded-xl text-sm"></div>
+    <div class="card">
+        <h3>Active Positions</h3>
+        <div id="positions">Loading...</div>
     </div>
 
     <script>
-        async function updateDashboard() {
-            try {
-                const res = await fetch('/dashboard_data');
-                const data = await res.json();
-                
-                if(data.error) {
-                    document.getElementById('error-box').innerText = "System Error: " + data.error;
-                    document.getElementById('error-box').classList.remove('hidden');
-                    return;
-                }
-
-                // Update Stats
-                document.getElementById('status-text').innerText = data.engine_running ? "RUNNING" : "IDLE";
-                document.getElementById('status-text').className = data.engine_running ? "text-xl font-bold text-green-500" : "text-xl font-bold text-gray-500";
-                document.getElementById('funds').innerText = "₹" + data.funds.toLocaleString();
-                document.getElementById('order-ratio').innerText = `${data.orders_traded} / ${data.orders_sent}`;
-
-                // Update Positions
-                const posBody = document.getElementById('pos-body');
-                posBody.innerHTML = data.positions.map(p => `
-                    <tr class="border-b border-zinc-800">
-                        <td class="p-4 font-mono">${p.tradingsymbol}</td>
-                        <td class="p-4 ${p.quantity >= 0 ? 'text-green-400' : 'text-red-400'}">${p.quantity}</td>
-                        <td class="p-4">₹${p.average_price}</td>
-                        <td class="p-4 font-bold ${p.pnl >= 0 ? 'text-green-400' : 'text-red-400'}">₹${p.pnl.toFixed(2)}</td>
-                    </tr>
-                `).join('');
-                
-                document.getElementById('error-box').classList.add('hidden');
-            } catch (e) {
-                document.getElementById('status-text').innerText = "OFFLINE";
-            }
+        function updateRisk() {
+            $.ajax({
+                url: '/update_risk', type: 'POST', contentType: 'application/json',
+                data: JSON.stringify({tp: $('#tp').val(), sl: $('#sl').val()}),
+                success: (data) => alert('Risk Updated: TP ' + data.tp_pct + '% | SL ' + data.sl_pct + '%')
+            });
         }
-        setInterval(updateDashboard, 5000); // 5 second refresh
-        updateDashboard();
+
+        setInterval(() => {
+            $.get('/dashboard_data', (data) => {
+                let html = '<table><tr><th>Symbol</th><th>Qty</th><th>P&L</th></tr>';
+                data.positions.forEach(p => {
+                    if(p.quantity != 0) html += `<tr><td>${p.tradingsymbol}</td><td>${p.quantity}</td><td>${p.pnl}</td></tr>`;
+                });
+                $('#positions').html(html + '</table>');
+            });
+        }, 5000);
     </script>
 </body>
 </html>
