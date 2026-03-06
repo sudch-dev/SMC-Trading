@@ -1,53 +1,60 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>ATM Option Bot</title>
+    <title>Interactive Option Terminal</title>
+    <link href="https://cdn.jsdelivr.net" rel="stylesheet">
     <script src="https://code.jquery.com"></script>
     <style>
-        body { font-family: sans-serif; padding: 20px; background: #f4f4f9; }
-        .card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        input { padding: 8px; width: 60px; margin-right: 10px; }
-        button { padding: 8px 15px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+        .status-dot { height: 12px; width: 12px; border-radius: 50%; display: inline-block; }
+        .green { background-color: #28a745; } .red { background-color: #dc3545; }
     </style>
 </head>
-<body>
-    <h1>Kite ATM Option Bot</h1>
-    
-    <div class="card">
-        <h3>Authentication</h3>
-        {% if not auth %}<a href="/login"><button>Login to Zerodha</button></a>{% else %}<span style="color:green;">● Connected</span>{% endif %}
-    </div>
-
-    <div class="card">
-        <h3>Risk Management (TP/SL %)</h3>
-        Target: <input type="number" id="tp" value="20"> 
-        Stoploss: <input type="number" id="sl" value="10">
-        <button onclick="updateRisk()">Update Limits</button>
-    </div>
-
-    <div class="card">
-        <h3>Active Positions</h3>
-        <div id="positions">Loading...</div>
+<body class="bg-light p-4">
+    <div class="container bg-white p-4 rounded shadow">
+        <h2>ATM Option Terminal <span class="status-dot {% if auth %}green{% else %}red{% endif %}"></span></h2>
+        <hr>
+        <div class="row">
+            <div class="col-md-4 mb-3">
+                <label>Target (%)</label>
+                <input type="number" id="tp" class="form-control" value="{{config.target_pct}}">
+            </div>
+            <div class="col-md-4 mb-3">
+                <label>Stoploss (%)</label>
+                <input type="number" id="sl" class="form-control" value="{{config.sl_pct}}">
+            </div>
+            <div class="col-md-4 mb-3">
+                <label>Side</label>
+                <select id="side" class="form-select">
+                    <option value="NONE">SELECT SIDE</option>
+                    <option value="CE">CALL (CE)</option>
+                    <option value="PE">PUT (PE)</option>
+                </select>
+            </div>
+        </div>
+        <div class="d-grid gap-2">
+            <button onclick="startTrade()" class="btn btn-success btn-lg">START AUTOMATION</button>
+            <button onclick="emergencyExit()" class="btn btn-danger">EMERGENCY SQUARE OFF</button>
+        </div>
+        <hr>
+        <h4>Live Positions</h4>
+        <div id="pos_table"></div>
     </div>
 
     <script>
-        function updateRisk() {
-            $.ajax({
-                url: '/update_risk', type: 'POST', contentType: 'application/json',
-                data: JSON.stringify({tp: $('#tp').val(), sl: $('#sl').val()}),
-                success: (data) => alert('Risk Updated: TP ' + data.tp_pct + '% | SL ' + data.sl_pct + '%')
-            });
+        function startTrade() {
+            const data = { tp: $('#tp').val(), sl: $('#sl').val(), side: $('#side').val(), run: true };
+            $.ajax({ url: '/update_trade', type: 'POST', contentType: 'application/json', data: JSON.stringify(data) });
         }
-
+        function emergencyExit() {
+            $.get('/update_trade', () => { window.location.reload(); }); // Simple square off logic
+        }
         setInterval(() => {
-            $.get('/dashboard_data', (data) => {
-                let html = '<table><tr><th>Symbol</th><th>Qty</th><th>P&L</th></tr>';
-                data.positions.forEach(p => {
-                    if(p.quantity != 0) html += `<tr><td>${p.tradingsymbol}</td><td>${p.quantity}</td><td>${p.pnl}</td></tr>`;
-                });
-                $('#positions').html(html + '</table>');
+            $.get('/status', (res) => {
+                let h = '<table class="table"><thead><tr><th>Symbol</th><th>LTP</th><th>P&L</th></tr></thead><tbody>';
+                res.positions.forEach(p => { if(p.quantity != 0) h += `<tr><td>${p.tradingsymbol}</td><td>${p.last_price}</td><td class="${p.pnl >= 0 ? 'text-success' : 'text-danger'}">${p.pnl}</td></tr>`; });
+                $('#pos_table').html(h + '</tbody></table>');
             });
-        }, 5000);
+        }, 2000);
     </script>
 </body>
 </html>
