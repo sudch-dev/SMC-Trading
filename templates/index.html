@@ -1,60 +1,180 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Interactive Option Terminal</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kite Option Terminal</title>
     <link href="https://cdn.jsdelivr.net" rel="stylesheet">
-    <script src="https://code.jquery.com"></script>
+    <link href="https://fonts.googleapis.com" rel="stylesheet">
     <style>
-        .status-dot { height: 12px; width: 12px; border-radius: 50%; display: inline-block; }
-        .green { background-color: #28a745; } .red { background-color: #dc3545; }
+        body { font-family: 'Inter', sans-serif; background-color: #f8f9fa; color: #212529; }
+        .navbar { background: #000; color: #fff; padding: 1rem; }
+        .card { border: none; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        .status-dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; margin-right: 5px; }
+        .status-online { background-color: #28a745; box-shadow: 0 0 8px #28a745; }
+        .status-offline { background-color: #dc3545; }
+        .pnl-badge { font-size: 1.2rem; font-weight: 700; padding: 8px 15px; border-radius: 8px; }
+        .btn-start { background-color: #3d5afe; color: white; font-weight: 600; border: none; }
+        .btn-start:hover { background-color: #304ffe; }
+        .btn-exit { background-color: #ff1744; color: white; font-weight: 600; border: none; }
+        .table thead th { border-top: none; color: #6c757d; font-size: 0.85rem; text-transform: uppercase; }
+        .form-label { font-size: 0.9rem; font-weight: 600; color: #495057; }
     </style>
 </head>
-<body class="bg-light p-4">
-    <div class="container bg-white p-4 rounded shadow">
-        <h2>ATM Option Terminal <span class="status-dot {% if auth %}green{% else %}red{% endif %}"></span></h2>
-        <hr>
-        <div class="row">
-            <div class="col-md-4 mb-3">
-                <label>Target (%)</label>
-                <input type="number" id="tp" class="form-control" value="{{config.target_pct}}">
-            </div>
-            <div class="col-md-4 mb-3">
-                <label>Stoploss (%)</label>
-                <input type="number" id="sl" class="form-control" value="{{config.sl_pct}}">
-            </div>
-            <div class="col-md-4 mb-3">
-                <label>Side</label>
-                <select id="side" class="form-select">
-                    <option value="NONE">SELECT SIDE</option>
-                    <option value="CE">CALL (CE)</option>
-                    <option value="PE">PUT (PE)</option>
-                </select>
-            </div>
-        </div>
-        <div class="d-grid gap-2">
-            <button onclick="startTrade()" class="btn btn-success btn-lg">START AUTOMATION</button>
-            <button onclick="emergencyExit()" class="btn btn-danger">EMERGENCY SQUARE OFF</button>
-        </div>
-        <hr>
-        <h4>Live Positions</h4>
-        <div id="pos_table"></div>
-    </div>
+<body>
 
-    <script>
-        function startTrade() {
-            const data = { tp: $('#tp').val(), sl: $('#sl').val(), side: $('#side').val(), run: true };
-            $.ajax({ url: '/update_trade', type: 'POST', contentType: 'application/json', data: JSON.stringify(data) });
-        }
-        function emergencyExit() {
-            $.get('/update_trade', () => { window.location.reload(); }); // Simple square off logic
-        }
-        setInterval(() => {
-            $.get('/status', (res) => {
-                let h = '<table class="table"><thead><tr><th>Symbol</th><th>LTP</th><th>P&L</th></tr></thead><tbody>';
-                res.positions.forEach(p => { if(p.quantity != 0) h += `<tr><td>${p.tradingsymbol}</td><td>${p.last_price}</td><td class="${p.pnl >= 0 ? 'text-success' : 'text-danger'}">${p.pnl}</td></tr>`; });
-                $('#pos_table').html(h + '</tbody></table>');
+<nav class="navbar mb-4">
+    <div class="container d-flex justify-content-between">
+        <span class="navbar-brand mb-0 h1">⚡ KITE OPTION TERMINAL</span>
+        <div class="d-flex align-items-center">
+            <span class="status-dot {% if auth %}status-online{% else %}status-offline{% endif %}"></span>
+            <small>{% if auth %}API CONNECTED{% else %}DISCONNECTED{% endif %}</small>
+        </div>
+    </div>
+</nav>
+
+<div class="container">
+    <div class="row g-4">
+        <!-- Control Panel -->
+        <div class="col-lg-4">
+            <div class="card p-4 h-100">
+                <h5 class="mb-4 fw-bold">Trade Parameters</h5>
+                
+                <div class="mb-3">
+                    <label class="form-label">Order Type (ATM)</label>
+                    <select id="side" class="form-select border-2">
+                        <option value="NONE" {% if config.active_side == 'NONE' %}selected{% endif %}>Select Strategy</option>
+                        <option value="CE" {% if config.active_side == 'CE' %}selected{% endif %}>NIFTY CALL (CE)</option>
+                        <option value="PE" {% if config.active_side == 'PE' %}selected{% endif %}>NIFTY PUT (PE)</option>
+                    </select>
+                </div>
+
+                <div class="row g-2 mb-4">
+                    <div class="col-6">
+                        <label class="form-label">Target %</label>
+                        <input type="number" id="tp" class="form-control border-2" value="{{config.target_pct}}">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label">Stoploss %</label>
+                        <input type="number" id="sl" class="form-control border-2" value="{{config.sl_pct}}">
+                    </div>
+                </div>
+
+                <div class="d-grid gap-3">
+                    {% if not auth %}
+                        <a href="/login" class="btn btn-dark p-3">AUTHENTICATE ZERODHA</a>
+                    {% else %}
+                        <button onclick="updateTrade(true)" id="btnStart" class="btn btn-start p-3">EXECUTE & AUTO-MONITOR</button>
+                        <button onclick="updateTrade(false)" class="btn btn-outline-secondary">PAUSE BOT</button>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Dashboard -->
+        <div class="col-lg-8">
+            <div class="card p-4 mb-4">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0">Active Positions</h5>
+                    <button onclick="emergencyExit()" class="btn btn-exit btn-sm">EMERGENCY SQUARE OFF</button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table align-middle">
+                        <thead>
+                            <tr>
+                                <th>Instrument</th>
+                                <th>Qty</th>
+                                <th>Avg. Price</th>
+                                <th>LTP</th>
+                                <th class="text-end">Unrealized P&L</th>
+                            </tr>
+                        </thead>
+                        <tbody id="pos_body">
+                            <!-- Data injected via JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Error Log -->
+            <div id="error_alert" class="alert alert-danger d-none" role="alert"></div>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com"></script>
+<script>
+    function updateTrade(runState) {
+        const data = {
+            tp: $('#tp').val(),
+            sl: $('#sl').val(),
+            side: $('#side').val(),
+            run: runState
+        };
+
+        $.ajax({
+            url: '/update_trade',
+            type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(data),
+            success: function(res) {
+                alert(runState ? "Trade Executed / Monitoring Active" : "Bot Paused");
+                location.reload();
+            }
+        });
+    }
+
+    function emergencyExit() {
+        if(confirm("Confirm Square Off All Positions?")) {
+            const data = { tp: 20, sl: 10, side: "NONE", run: false };
+            $.ajax({
+                url: '/update_trade',
+                type: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify(data),
+                success: function() { 
+                    alert("Emergency Exit Command Sent");
+                    location.reload();
+                }
             });
-        }, 2000);
-    </script>
+        }
+    }
+
+    function refreshData() {
+        $.get('/status', function(data) {
+            let html = '';
+            let totalPnl = 0;
+
+            if (data.positions.length === 0) {
+                html = '<tr><td colspan="5" class="text-center py-4 text-muted">No Open Positions</td></tr>';
+            } else {
+                data.positions.forEach(p => {
+                    if (p.quantity !== 0) {
+                        const pnlClass = p.pnl >= 0 ? 'text-success' : 'text-danger';
+                        html += `
+                            <tr>
+                                <td class="fw-bold">${p.tradingsymbol}</td>
+                                <td><span class="badge bg-light text-dark border">${p.quantity}</span></td>
+                                <td>₹${p.average_price.toFixed(2)}</td>
+                                <td>₹${p.last_price.toFixed(2)}</td>
+                                <td class="text-end fw-bold ${pnlClass}">₹${p.pnl.toFixed(2)}</td>
+                            </tr>
+                        `;
+                    }
+                });
+            }
+            $('#pos_body').html(html);
+            
+            if (data.error) {
+                $('#error_alert').text(data.error).removeClass('d-none');
+            } else {
+                $('#error_alert').addClass('d-none');
+            }
+        });
+    }
+
+    setInterval(refreshData, 2000);
+</script>
+
 </body>
 </html>
